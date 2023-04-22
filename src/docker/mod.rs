@@ -1,4 +1,5 @@
-pub mod custom;
+mod build;
+pub(crate) mod custom;
 mod engine;
 mod image;
 mod local;
@@ -6,6 +7,7 @@ mod provided_images;
 pub mod remote;
 mod shared;
 
+pub use self::build::{BuildCommandExt, BuildResultExt, Progress};
 pub use self::engine::*;
 pub use self::provided_images::PROVIDED_IMAGES;
 pub use self::shared::*;
@@ -43,6 +45,7 @@ pub fn run(
     options: DockerOptions,
     paths: DockerPaths,
     args: &[String],
+    subcommand: Option<crate::Subcommand>,
     msg_info: &mut MessageInfo,
 ) -> Result<ExitStatus> {
     if cfg!(target_os = "windows") && options.in_docker() {
@@ -52,7 +55,8 @@ pub fn run(
         );
     }
     if options.is_remote() {
-        remote::run(options, paths, args, msg_info).wrap_err("could not complete remote run")
+        remote::run(options, paths, args, subcommand, msg_info)
+            .wrap_err("could not complete remote run")
     } else {
         local::run(options, paths, args, msg_info)
     }

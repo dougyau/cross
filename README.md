@@ -48,10 +48,10 @@ for detailed installation instructions.
 One of these container engines is required. If both are installed, `cross` will
 default to `docker`.
 
-- [Docker]. Note that on Linux non-sudo users need to be in the `docker` group.
-  Read the official [post-installation steps][post]. Requires version 20.10 (API 1.40) or later.
+- [Docker]. Note that on Linux non-sudo users need to be in the `docker` group or use rootless docker.
+  Read the container engine [install guide][install] for the required installation and post-installation steps. Requires version 20.10 (API 1.40) or later.
 
-[post]: https://docs.docker.com/install/linux/linux-postinstall/
+[install]: https://github.com/cross-rs/cross/wiki/Getting-Started#installing-a-container-engine
 
 - [Podman]. Requires version 3.4.0 or later.
 
@@ -234,10 +234,7 @@ For example in case you want use [Podman], you can set `CROSS_CONTAINER_ENGINE=p
 
 ### Passing environment variables into the build environment
 
-By default, `cross` does not pass any environment variables into the build
-environment from the calling shell. This is chosen as a safe default as most use
-cases will not want the calling environment leaking into the inner execution
-environment.
+By default, `cross` does not pass most environment variables into the build environment from the calling shell. This is chosen as a safe default as most use cases will not want the calling environment leaking into the inner execution environment. There are, however, some notable exceptions: most environment variables `cross` or [cargo reads](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-reads) are passed through automatically to the build environment.
 
 In the instances that you do want to pass through environment variables, this
 can be done via `build.env.passthrough` in your `Cross.toml`:
@@ -260,6 +257,8 @@ passthrough = [
     "RUST_DEBUG",
 ]
 ```
+
+For more detailed documentation on which environment variables are automatically passed to the build environment, see [Environment Variable Passthrough](https://github.com/cross-rs/cross/wiki/Configuration#environment-variable-passthrough) on our wiki.
 
 ### Unstable Features
 
@@ -348,7 +347,6 @@ terminate.
 | `i686-linux-android` [1]             | 9.0.8  | 9.0.8   | ✓   | 6.1.0 |   ✓    |
 | `i686-pc-windows-gnu`                | N/A    | 9.4     | ✓   | N/A   |   ✓    |
 | `i686-unknown-linux-gnu`             | 2.31   | 9.4.0   | ✓   | 6.1.0 |   ✓    |
-| `mips-unknown-linux-musl`            | 1.1.24 | 9.2.0   | ✓   | 6.1.0 |   ✓    |
 | `mips-unknown-linux-gnu`             | 2.30   | 9.4.0   | ✓   | 6.1.0 |   ✓    |
 | `mips-unknown-linux-musl`            | 1.1.24  | 9.2.0   | ✓   | 6.1.0 |   ✓    |
 | `mips64-unknown-linux-gnuabi64`      | 2.30   | 9.4.0   | ✓   | 6.1.0 |   ✓    |
@@ -370,6 +368,9 @@ terminate.
 | `thumbv7m-none-eabi` [4]             | 3.3.0  | 9.2.1   |     | N/A   |       |
 | `thumbv7neon-linux-androideabi` [1]  | 9.0.8  | 9.0.8   | ✓   | 6.1.0 |   ✓    |
 | `thumbv7neon-unknown-linux-gnueabihf`| 2.31   | 9.4.0   | ✓   | N/A   |   ✓    |
+| `thumbv8m.base-none-eabi` [4]        | 3.3.0  | 9.2.1   |     | N/A   |       |
+| `thumbv8m.main-none-eabi` [4]        | 3.3.0  | 9.2.1   |     | N/A   |       |
+| `thumbv8m.main-none-eabihf` [4]      | 3.3.0  | 9.2.1   |     | N/A   |       |
 | `wasm32-unknown-emscripten` [6]        | 3.1.14 | 15.0.0  | ✓   | N/A   |   ✓    |
 | `x86_64-linux-android` [1]           | 9.0.8  | 9.0.8   | ✓   | 6.1.0 |   ✓    |
 | `x86_64-pc-windows-gnu`              | N/A    | 9.3     | ✓   | N/A   |   ✓    |
@@ -431,7 +432,7 @@ $ QEMU_STRACE=1 cross run --target aarch64-unknown-linux-gnu
 
 ## Minimum Supported Rust Version (MSRV)
 
-This crate is guaranteed to compile on stable Rust 1.58.1 and up. It *might*
+This crate is guaranteed to compile on stable Rust 1.64.0 and up. It *might*
 compile with older versions but that may change in any new patch release.
 
 Some cross-compilation targets require a later Rust version, and using Xargo

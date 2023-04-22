@@ -24,7 +24,7 @@
     clippy::semicolon_if_nothing_returned,
     clippy::str_to_string,
     clippy::string_to_string,
-    // needs clippy 1.61 clippy::unwrap_used
+    clippy::unwrap_used
 )]
 
 #[cfg(test)]
@@ -70,8 +70,8 @@ pub use self::rustc::{TargetList, VersionMetaExt};
 pub const CROSS_LABEL_DOMAIN: &str = "org.cross-rs";
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash, Serialize)]
-#[serde(from = "&str")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Hash)]
+#[serde(from = "&str", into = "String")]
 #[serde(rename_all = "snake_case")]
 pub enum TargetTriple {
     Other(String),
@@ -261,6 +261,12 @@ impl From<String> for TargetTriple {
     }
 }
 
+impl Serialize for TargetTriple {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.triple())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(from = "String")]
 pub enum Target {
@@ -304,7 +310,10 @@ impl Target {
     }
 
     fn is_bare_metal(&self) -> bool {
-        self.triple().contains("thumb")
+        self.triple().ends_with("-none")
+            || self.triple().ends_with("-none-elf")
+            || self.triple().ends_with("-none-eabi")
+            || self.triple().ends_with("-none-eabihf")
     }
 
     fn is_builtin(&self) -> bool {
@@ -501,9 +510,10 @@ pub fn run(
     msg_info: &mut MessageInfo,
 ) -> Result<Option<ExitStatus>> {
     if args.version && args.subcommand.is_none() {
-        msg_info.print(format_args!(
-            concat!("cross ", env!("CARGO_PKG_VERSION"), "{}"),
-            crate::commit_info()
+        msg_info.print(concat!(
+            "cross ",
+            env!("CARGO_PKG_VERSION"),
+            crate::commit_info!()
         ))?;
     }
 
@@ -511,62 +521,28 @@ pub fn run(
 
     let cwd = std::env::current_dir()?;
     if let Some(metadata) = cargo_metadata_with_args(None, Some(&args), msg_info)? {
-        let host = host_version_meta.host();
-        let toml = toml(&metadata, msg_info)?;
-        let config = Config::new(toml);
-        let target = args
-            .target
-            .or_else(|| config.target(&target_list))
-            .unwrap_or_else(|| Target::from(host.triple(), &target_list));
-        config.confusable_target(&target, msg_info)?;
-
-        let uses_zig = config.zig(&target).unwrap_or(false);
-        let zig_version = config.zig_version(&target)?;
-        // Get the image we're supposed to base all our next actions on.
-        // The image we actually run in might get changed with
-        // `target.{{TARGET}}.dockerfile` or `target.{{TARGET}}.pre-build`
-        let image = match docker::get_image(&config, &target, uses_zig) {
-            Ok(i) => i,
-            Err(err) => {
-                msg_info.warn(err)?;
-
+        let CrossSetup {
+            config,
+            target,
+            uses_xargo,
+            uses_zig,
+            uses_build_std,
+            zig_version,
+            toolchain,
+            is_remote,
+            engine,
+            image,
+        } = match setup(&host_version_meta, &metadata, &args, target_list, msg_info)? {
+            Some(setup) => setup,
+            _ => {
                 return Ok(None);
             }
         };
 
-        // Grab the current toolchain, this might be the one we mount in the image later
-        let default_toolchain = QualifiedToolchain::default(&config, msg_info)?;
+        config.confusable_target(&target, msg_info)?;
 
-        // `cross +channel`, where channel can be `+channel[-YYYY-MM-DD]`
-        let mut toolchain = if let Some(channel) = args.channel {
-            let picked_toolchain: Toolchain = channel.parse()?;
-
-            if let Some(picked_host) = &picked_toolchain.host {
-                return Err(eyre::eyre!("the specified toolchain `{picked_toolchain}` can't be used"))
-                    .with_suggestion(|| {
-                        format!(
-                            "try `cross +{}` instead",
-                            Toolchain {
-                                host: None,
-                                ..picked_toolchain
-                            }
-                        )
-                    }).with_section(|| format!(
-r#"Overriding the toolchain in cross is only possible in CLI by specifying a channel and optional date: `+channel[-YYYY-MM-DD]`.
-To override the toolchain mounted in the image, set `target.{}.image.toolchain = "{picked_host}"`"#, target).header("Note:".bright_cyan()));
-            }
-
-            default_toolchain.with_picked(picked_toolchain)?
-        } else {
-            default_toolchain
-        };
-
-        let is_remote = docker::Engine::is_remote();
-        let engine = docker::Engine::new(None, Some(is_remote), msg_info)?;
-
-        let image = image.to_definite_with(&engine, msg_info);
-
-        toolchain.replace_host(&image.platform);
+        let picked_generic_channel =
+            matches!(toolchain.channel.as_str(), "stable" | "beta" | "nightly");
 
         if image.platform.target.is_supported(Some(&target)) {
             if image.platform.architecture != toolchain.host().architecture {
@@ -574,145 +550,73 @@ To override the toolchain mounted in the image, set `target.{}.image.toolchain =
                     "toolchain `{toolchain}` may not run on image `{image}`"
                 ))?;
             }
-            // set the sysroot explicitly to the toolchain
             let mut is_nightly = toolchain.channel.contains("nightly");
-
-            let installed_toolchains = rustup::installed_toolchains(msg_info)?;
-
-            if !installed_toolchains
-                .into_iter()
-                .any(|t| t == toolchain.to_string())
-            {
-                rustup::install_toolchain(&toolchain, msg_info)?;
-            }
-            let available_targets = if !toolchain.is_custom {
-                rustup::available_targets(&toolchain.full, msg_info)?
-            } else {
-                rustup::AvailableTargets {
-                    default: String::new(),
-                    installed: vec![],
-                    not_installed: vec![],
-                }
-            };
-
-            if let Some((rustc_version, channel, rustc_commit)) = toolchain.rustc_version()? {
-                if toolchain.date.is_none() {
+            let mut rustc_version = None;
+            if let Some((version, channel, commit)) = toolchain.rustc_version()? {
+                if picked_generic_channel && toolchain.date.is_none() {
                     warn_host_version_mismatch(
                         &host_version_meta,
                         &toolchain,
-                        &rustc_version,
-                        &rustc_commit,
+                        &version,
+                        &commit,
                         msg_info,
                     )?;
                 }
                 is_nightly = channel == Channel::Nightly;
+                rustc_version = Some(version);
             }
 
-            let uses_build_std = config.build_std(&target).unwrap_or(false);
-            let uses_xargo =
-                !uses_build_std && config.xargo(&target).unwrap_or(!target.is_builtin());
-            let cargo_variant = CargoVariant::create(uses_zig, uses_xargo)?;
-            if !toolchain.is_custom {
-                // build-std overrides xargo, but only use it if it's a built-in
-                // tool but not an available target or doesn't have rust-std.
+            let available_targets = rustup::setup_rustup(&toolchain, msg_info)?;
 
-                if !is_nightly && uses_build_std {
-                    eyre::bail!(
-                        "no rust-std component available for {}: must use nightly",
-                        target.triple()
-                    );
-                }
+            rustup::setup_components(
+                &target,
+                uses_xargo,
+                uses_build_std,
+                &toolchain,
+                is_nightly,
+                available_targets,
+                &args,
+                msg_info,
+            )?;
 
-                if !uses_xargo
-                    && !uses_build_std
-                    && !available_targets.is_installed(&target)
-                    && available_targets.contains(&target)
-                {
-                    rustup::install(&target, &toolchain, msg_info)?;
-                } else if !rustup::component_is_installed("rust-src", &toolchain, msg_info)? {
-                    rustup::install_component("rust-src", &toolchain, msg_info)?;
-                }
-                if args.subcommand.map_or(false, |sc| sc == Subcommand::Clippy)
-                    && !rustup::component_is_installed("clippy", &toolchain, msg_info)?
-                {
-                    rustup::install_component("clippy", &toolchain, msg_info)?;
-                }
-            }
-
-            let needs_interpreter = args.subcommand.map_or(false, |sc| sc.needs_interpreter());
-
-            let add_libc = |triple: &str| add_libc_version(triple, zig_version.as_deref());
-            let mut filtered_args = if args
-                .subcommand
-                .map_or(false, |s| !s.needs_target_in_command())
-            {
-                let mut filtered_args = Vec::new();
-                let mut args_iter = args.all.clone().into_iter();
-                while let Some(arg) = args_iter.next() {
-                    if arg == "--target" {
-                        args_iter.next();
-                    } else if arg.starts_with("--target=") {
-                        // NOOP
-                    } else {
-                        filtered_args.push(arg);
-                    }
-                }
-                filtered_args
-            // Make sure --target is present
-            } else if !args.all.iter().any(|a| a.starts_with("--target")) {
-                let mut args_with_target = args.all.clone();
-                args_with_target.push("--target".to_owned());
-                args_with_target.push(add_libc(target.triple()));
-                args_with_target
-            } else if zig_version.is_some() {
-                let mut filtered_args = Vec::new();
-                let mut args_iter = args.all.clone().into_iter();
-                while let Some(arg) = args_iter.next() {
-                    if arg == "--target" {
-                        filtered_args.push("--target".to_owned());
-                        if let Some(triple) = args_iter.next() {
-                            filtered_args.push(add_libc(&triple));
-                        }
-                    } else if let Some(stripped) = arg.strip_prefix("--target=") {
-                        filtered_args.push(format!("--target={}", add_libc(stripped)));
-                    } else {
-                        filtered_args.push(arg);
-                    }
-                }
-                filtered_args
-            } else {
-                args.all.clone()
-            };
-
-            let is_test = args.subcommand.map_or(false, |sc| sc == Subcommand::Test);
-            if is_test && config.doctests().unwrap_or_default() && is_nightly {
-                filtered_args.push("-Zdoctest-xcompile".to_owned());
-            }
-            if uses_build_std {
-                filtered_args.push("-Zbuild-std".to_owned());
-            }
+            let filtered_args = get_filtered_args(
+                zig_version,
+                &args,
+                &target,
+                &config,
+                is_nightly,
+                uses_build_std,
+            );
 
             let needs_docker = args
                 .subcommand
                 .map_or(false, |sc| sc.needs_docker(is_remote));
             if target.needs_docker() && needs_docker {
-                if host_version_meta.needs_interpreter()
-                    && needs_interpreter
-                    && target.needs_interpreter()
-                    && !interpreter::is_registered(&target)?
-                {
-                    docker::register(&engine, &target, msg_info)?;
-                }
-
-                let paths = docker::DockerPaths::create(&engine, metadata, cwd, toolchain.clone())?;
+                let paths = docker::DockerPaths::create(
+                    &engine,
+                    metadata,
+                    cwd,
+                    toolchain.clone(),
+                    msg_info,
+                )?;
                 let options = docker::DockerOptions::new(
                     engine,
                     target.clone(),
                     config,
                     image,
-                    cargo_variant,
+                    crate::CargoVariant::create(uses_zig, uses_xargo)?,
+                    rustc_version,
                 );
-                let status = docker::run(options, paths, &filtered_args, msg_info)
+
+                install_interpreter_if_needed(
+                    &args,
+                    host_version_meta,
+                    &target,
+                    &options,
+                    msg_info,
+                )?;
+
+                let status = docker::run(options, paths, &filtered_args, args.subcommand, msg_info)
                     .wrap_err("could not run container")?;
                 let needs_host = args.subcommand.map_or(false, |sc| sc.needs_host(is_remote));
                 if !status.success() {
@@ -725,6 +629,169 @@ To override the toolchain mounted in the image, set `target.{}.image.toolchain =
         }
     }
     Ok(None)
+}
+
+/// Check if an interpreter is needed and then install it.
+pub fn install_interpreter_if_needed(
+    args: &Args,
+    host_version_meta: rustc_version::VersionMeta,
+    target: &Target,
+    options: &docker::DockerOptions,
+    msg_info: &mut MessageInfo,
+) -> Result<(), color_eyre::Report> {
+    let needs_interpreter = args.subcommand.map_or(false, |sc| sc.needs_interpreter());
+
+    if host_version_meta.needs_interpreter()
+        && needs_interpreter
+        && target.needs_interpreter()
+        && !interpreter::is_registered(target)?
+    {
+        options.engine.register_binfmt(target, msg_info)?;
+    }
+    Ok(())
+}
+
+/// Get filtered args to pass to cargo
+pub fn get_filtered_args(
+    zig_version: Option<String>,
+    args: &Args,
+    target: &Target,
+    config: &Config,
+    is_nightly: bool,
+    uses_build_std: bool,
+) -> Vec<String> {
+    let add_libc = |triple: &str| add_libc_version(triple, zig_version.as_deref());
+    let mut filtered_args = if args
+        .subcommand
+        .map_or(false, |s| !s.needs_target_in_command())
+    {
+        let mut filtered_args = Vec::new();
+        let mut args_iter = args.cargo_args.clone().into_iter();
+        while let Some(arg) = args_iter.next() {
+            if arg == "--target" {
+                args_iter.next();
+            } else if arg.starts_with("--target=") {
+                // NOOP
+            } else {
+                filtered_args.push(arg);
+            }
+        }
+        filtered_args
+    // Make sure --target is present
+    } else if !args.cargo_args.iter().any(|a| a.starts_with("--target")) {
+        let mut args_with_target = args.cargo_args.clone();
+        args_with_target.push("--target".to_owned());
+        args_with_target.push(add_libc(target.triple()));
+        args_with_target
+    } else if zig_version.is_some() {
+        let mut filtered_args = Vec::new();
+        let mut args_iter = args.cargo_args.clone().into_iter();
+        while let Some(arg) = args_iter.next() {
+            if arg == "--target" {
+                filtered_args.push("--target".to_owned());
+                if let Some(triple) = args_iter.next() {
+                    filtered_args.push(add_libc(&triple));
+                }
+            } else if let Some(stripped) = arg.strip_prefix("--target=") {
+                filtered_args.push(format!("--target={}", add_libc(stripped)));
+            } else {
+                filtered_args.push(arg);
+            }
+        }
+        filtered_args
+    } else {
+        args.cargo_args.clone()
+    };
+
+    let is_test = args.subcommand.map_or(false, |sc| sc == Subcommand::Test);
+    if is_test && config.doctests().unwrap_or_default() && is_nightly {
+        filtered_args.push("-Zdoctest-xcompile".to_owned());
+    }
+    if uses_build_std {
+        filtered_args.push("-Zbuild-std".to_owned());
+    }
+    filtered_args.extend(args.rest_args.iter().cloned());
+    filtered_args
+}
+
+/// Setup cross configuration
+pub fn setup(
+    host_version_meta: &rustc_version::VersionMeta,
+    metadata: &CargoMetadata,
+    args: &Args,
+    target_list: TargetList,
+    msg_info: &mut MessageInfo,
+) -> Result<Option<CrossSetup>, color_eyre::Report> {
+    let host = host_version_meta.host();
+    let toml = toml(metadata, msg_info)?;
+    let config = Config::new(toml);
+    let target = args
+        .target
+        .clone()
+        .or_else(|| config.target(&target_list))
+        .unwrap_or_else(|| Target::from(host.triple(), &target_list));
+    let uses_build_std = config.build_std(&target).unwrap_or(false);
+    let uses_xargo = !uses_build_std && config.xargo(&target).unwrap_or(!target.is_builtin());
+    let uses_zig = config.zig(&target).unwrap_or(false);
+    let zig_version = config.zig_version(&target)?;
+    let image = match docker::get_image(&config, &target, uses_zig) {
+        Ok(i) => i,
+        Err(err) => {
+            msg_info.warn(err)?;
+
+            return Ok(None);
+        }
+    };
+    let default_toolchain = QualifiedToolchain::default(&config, msg_info)?;
+    let mut toolchain = if let Some(channel) = &args.channel {
+        let picked_toolchain: Toolchain = channel.parse()?;
+
+        if let Some(picked_host) = &picked_toolchain.host {
+            return Err(eyre::eyre!("the specified toolchain `{picked_toolchain}` can't be used"))
+                .with_suggestion(|| {
+                    format!(
+                        "try `cross +{}` instead",
+                        picked_toolchain.remove_host()
+                    )
+                }).with_section(|| format!(
+    r#"Overriding the toolchain in cross is only possible in CLI by specifying a channel and optional date: `+channel[-YYYY-MM-DD]`.
+To override the toolchain mounted in the image, set `target.{target}.image.toolchain = "{picked_host}"`"#).header("Note:".bright_cyan()));
+        }
+
+        default_toolchain.with_picked(picked_toolchain)?
+    } else {
+        default_toolchain
+    };
+    let is_remote = docker::Engine::is_remote();
+    let engine = docker::Engine::new(None, Some(is_remote), msg_info)?;
+    let image = image.to_definite_with(&engine, msg_info);
+    toolchain.replace_host(&image.platform);
+    Ok(Some(CrossSetup {
+        config,
+        target,
+        uses_xargo,
+        uses_zig,
+        uses_build_std,
+        zig_version,
+        toolchain,
+        is_remote,
+        engine,
+        image,
+    }))
+}
+
+#[derive(Debug)]
+pub struct CrossSetup {
+    pub config: Config,
+    pub target: Target,
+    pub uses_xargo: bool,
+    pub uses_zig: bool,
+    pub uses_build_std: bool,
+    pub zig_version: Option<String>,
+    pub toolchain: QualifiedToolchain,
+    pub is_remote: bool,
+    pub engine: docker::Engine,
+    pub image: docker::Image,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -756,23 +823,36 @@ pub(crate) fn warn_host_version_mismatch(
             host_version_meta.short_version_string
         );
         if versions.is_lt() || (versions.is_eq() && dates.is_lt()) {
-            msg_info.warn(format_args!("using older {rustc_warning}.\n > Update with `rustup update --force-non-host {toolchain}`"))?;
+            if cfg!(not(test)) {
+                msg_info.warn(format_args!("using older {rustc_warning}.\n > Update with `rustup update --force-non-host {toolchain}`"))?;
+            }
             return Ok(VersionMatch::OlderTarget);
         } else if versions.is_gt() || (versions.is_eq() && dates.is_gt()) {
-            msg_info.warn(format_args!(
-                "using newer {rustc_warning}.\n > Update with `rustup update`"
-            ))?;
+            if cfg!(not(test)) {
+                msg_info.warn(format_args!(
+                    "using newer {rustc_warning}.\n > Update with `rustup update`"
+                ))?;
+            }
             return Ok(VersionMatch::NewerTarget);
         } else {
-            msg_info.warn(format_args!("using {rustc_warning}."))?;
+            if cfg!(not(test)) {
+                msg_info.warn(format_args!("using {rustc_warning}."))?;
+            }
             return Ok(VersionMatch::Different);
         }
     }
     Ok(VersionMatch::Same)
 }
 
-fn commit_info() -> &'static str {
-    include_str!(concat!(env!("OUT_DIR"), "/commit-info.txt"))
+pub const fn commit_info() -> &'static str {
+    commit_info!()
+}
+
+#[macro_export]
+macro_rules! commit_info {
+    () => {
+        include_str!(concat!(env!("OUT_DIR"), "/commit-info.txt"))
+    };
 }
 
 /// Obtains the [`CrossToml`] from one of the possible locations

@@ -1,11 +1,14 @@
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::util::{cargo_metadata, gha_error, gha_output, gha_print};
+use crate::util::{
+    cargo_metadata, get_matrix, gha_error, gha_output, gha_print, DEFAULT_PLATFORMS,
+};
+use crate::ImageTarget;
 use clap::Args;
-use cross::docker::ImagePlatform;
+use cross::docker::{self, BuildCommandExt, BuildResultExt, ImagePlatform, Progress};
 use cross::shell::MessageInfo;
-use cross::{docker, CommandExt, ToUtf8};
+use cross::{CommandExt, ToUtf8};
 
 #[derive(Args, Debug)]
 pub struct BuildDockerImage {
@@ -13,6 +16,9 @@ pub struct BuildDockerImage {
     pub ref_type: Option<String>,
     #[clap(long, hide = true, env = "GITHUB_REF_NAME")]
     ref_name: Option<String>,
+    /// Pass extra flags to the build
+    #[clap(long, env = "CROSS_BUILD_OPTS")]
+    build_opts: Option<String>,
     #[clap(action, long = "latest", hide = true, env = "LATEST")]
     is_latest: bool,
     /// Specify a tag to use instead of the derived one, eg `local`
@@ -49,9 +55,8 @@ pub struct BuildDockerImage {
     #[clap(
         long,
         value_parser = clap::builder::PossibleValuesParser::new(["auto", "plain", "tty"]),
-        default_value = "auto"
     )]
-    pub progress: String,
+    pub progress: Option<String>,
     /// Do not load from cache when building the image.
     #[clap(long)]
     pub no_cache: bool,
@@ -72,14 +77,14 @@ pub struct BuildDockerImage {
     pub platform: Vec<ImagePlatform>,
     /// Targets to build for
     #[clap()]
-    pub targets: Vec<crate::ImageTarget>,
+    pub targets: Vec<ImageTarget>,
 }
 
 fn locate_dockerfile(
-    target: crate::ImageTarget,
+    target: ImageTarget,
     docker_root: &Path,
     cross_toolchain_root: &Path,
-) -> cross::Result<(crate::ImageTarget, String)> {
+) -> cross::Result<(ImageTarget, String)> {
     let dockerfile_name = format!("Dockerfile.{target}");
     let dockerfile_root = if cross_toolchain_root.join(&dockerfile_name).exists() {
         &cross_toolchain_root
@@ -96,11 +101,11 @@ pub fn build_docker_image(
     BuildDockerImage {
         ref_type,
         ref_name,
+        build_opts,
         is_latest,
         tag: tag_override,
         repository,
         labels,
-        verbose,
         dry_run,
         force,
         push,
@@ -117,10 +122,6 @@ pub fn build_docker_image(
     engine: &docker::Engine,
     msg_info: &mut MessageInfo,
 ) -> cross::Result<()> {
-    let verbose = match verbose {
-        0 => msg_info.verbosity.level(),
-        v => v,
-    };
     let metadata = cargo_metadata(msg_info)?;
     let version = metadata
         .get_package("cross")
@@ -129,7 +130,7 @@ pub fn build_docker_image(
         .clone();
     if targets.is_empty() {
         if from_ci {
-            targets = crate::util::get_matrix()
+            targets = get_matrix()
                 .iter()
                 .filter(|m| m.os.starts_with("ubuntu"))
                 .map(|m| m.to_image_target())
@@ -151,6 +152,10 @@ pub fn build_docker_image(
         }
     }
     let gha = std::env::var("GITHUB_ACTIONS").is_ok();
+    let mut progress = progress.map(|x| x.parse().unwrap());
+    if gha {
+        progress = Some(Progress::Plain);
+    }
     let root = metadata.workspace_root;
     let docker_root = root.join("docker");
     let cross_toolchains_root = docker_root.join("cross-toolchains").join("docker");
@@ -160,7 +165,7 @@ pub fn build_docker_image(
         .collect::<cross::Result<Vec<_>>>()?;
 
     let platforms = if platform.is_empty() {
-        crate::util::DEFAULT_PLATFORMS.to_vec()
+        DEFAULT_PLATFORMS.to_vec()
     } else {
         platform
     };
@@ -175,15 +180,33 @@ pub fn build_docker_image(
         } else {
             msg_info.note(format_args!("Build {target} for {}", platform.target))?;
         }
-        let mut docker_build = docker::command(engine);
+        let mut docker_build = engine.command();
+        docker_build.invoke_build_command();
         let has_buildkit = docker::Engine::has_buildkit();
-        match has_buildkit {
-            true => docker_build.args(["buildx", "build"]),
-            false => docker_build.arg("build"),
-        };
         docker_build.current_dir(&docker_root);
 
-        docker_build.args(["--platform", &platform.docker_platform()]);
+        let docker_platform = platform.docker_platform();
+        let mut dockerfile = dockerfile.clone();
+        docker_build.args(["--platform", &docker_platform]);
+        let uppercase_triple = target.name.to_ascii_uppercase().replace('-', "_");
+        docker_build.args([
+            "--build-arg",
+            &format!("CROSS_TARGET_TRIPLE={}", uppercase_triple),
+        ]);
+        // add our platform, and determine if we need to use a native docker image
+        if has_native_image(docker_platform.as_str(), target, msg_info)? {
+            let dockerfile_name = match target.sub.as_deref() {
+                Some(sub) => format!("Dockerfile.native.{sub}"),
+                None => "Dockerfile.native".to_owned(),
+            };
+            let dockerfile_path = docker_root.join(&dockerfile_name);
+            if !dockerfile_path.exists() {
+                eyre::bail!(
+                    "unable to find native dockerfile named {dockerfile_name} for target {target}."
+                );
+            }
+            dockerfile = dockerfile_path.to_utf8()?.to_string();
+        }
 
         if push {
             docker_build.arg("--push");
@@ -221,18 +244,23 @@ pub fn build_docker_image(
         if engine.kind.supports_pull_flag() {
             docker_build.arg("--pull");
         }
+        let base_name = format!("{repository}/{}", target.name);
         if no_cache {
             docker_build.arg("--no-cache");
         } else if engine.kind.supports_cache_from_type() {
             docker_build.args([
                 "--cache-from",
-                &format!(
-                    "type=registry,ref={}",
-                    target.image_name(&repository, "main")
-                ),
+                &format!("type=registry,ref={base_name}:main"),
             ]);
         } else {
-            docker_build.args(["--cache-from", &format!("{repository}/{}", target.name)]);
+            // we can't use `image_name` since podman doesn't support tags
+            // with `--cache-from`. podman only supports an image format
+            // of registry/repo although it does when pulling images. this
+            // affects building from cache with target+subs images since we
+            // can't use caches from registry. this is only an issue if
+            // building with podman without a local cache, which never
+            // happens in practice.
+            docker_build.args(["--cache-from", &base_name]);
         }
 
         if push {
@@ -252,45 +280,29 @@ pub fn build_docker_image(
             docker_build.args(["--label", label]);
         }
 
-        docker_build.args([
-            "--label",
-            &format!(
-                "{}.for-cross-target={}",
-                cross::CROSS_LABEL_DOMAIN,
-                target.name
-            ),
-        ]);
-        docker_build.args([
-            "--label",
-            &format!(
-                "{}.runs-with={}",
-                cross::CROSS_LABEL_DOMAIN,
-                platform.target
-            ),
-        ]);
+        docker_build.cross_labels(&target.name, platform.target.triple());
+        docker_build.args(["--file", &dockerfile]);
 
-        docker_build.args(["-f", dockerfile]);
-
-        if gha || progress == "plain" {
-            docker_build.args(["--progress", "plain"]);
-        } else {
-            docker_build.args(["--progress", &progress]);
-        }
+        docker_build.progress(progress)?;
+        docker_build.verbose(msg_info.verbosity);
         for arg in &build_arg {
             docker_build.args(["--build-arg", arg]);
         }
-        if verbose > 1 {
-            docker_build.args(["--build-arg", "VERBOSE=1"]);
+
+        if let Some(opts) = &build_opts {
+            docker_build.args(docker::Engine::parse_opts(opts)?);
         }
 
-        if target.needs_workspace_root_context() {
-            docker_build.arg(&root);
-        } else {
-            docker_build.arg(".");
-        }
+        docker_build.arg(match target.needs_workspace_root_context() {
+            true => root.as_path(),
+            false => Path::new("."),
+        });
 
         if !dry_run && (force || !push || gha) {
-            let result = docker_build.run(msg_info, false);
+            let result = docker_build
+                .run(msg_info, false)
+                .engine_warning(engine)
+                .buildkit_warning();
             if gha && targets.len() > 1 {
                 if let Err(e) = &result {
                     // TODO: Determine what instruction errorred, and place warning on that line with appropriate warning
@@ -312,8 +324,8 @@ pub fn build_docker_image(
             }
         }
         if gha {
-            gha_output("image", &tags[0]);
-            gha_output("images", &format!("'{}'", serde_json::to_string(&tags)?));
+            gha_output("image", &tags[0])?;
+            gha_output("images", &format!("'{}'", serde_json::to_string(&tags)?))?;
             if targets.len() > 1 {
                 gha_print("::endgroup::");
             }
@@ -331,8 +343,42 @@ pub fn build_docker_image(
     Ok(())
 }
 
+fn has_native_image(
+    platform: &str,
+    target: &ImageTarget,
+    msg_info: &mut MessageInfo,
+) -> cross::Result<bool> {
+    let note_host_target_detection = |msg_info: &mut MessageInfo| -> cross::Result<()> {
+        msg_info.note("using the rust target triple to determine the host triple to determine if the docker platform is native. this may fail if cross-compiling xtask.")
+    };
+
+    Ok(match target.sub.as_deref() {
+        // FIXME: add additional subs for new Linux distros, such as alpine.
+        None | Some("centos") => match (platform, target.name.as_str()) {
+            ("linux/386", "i686-unknown-linux-gnu")
+            | ("linux/amd64", "x86_64-unknown-linux-gnu")
+            | ("linux/arm64" | "linux/arm64/v8", "aarch64-unknown-linux-gnu")
+            | ("linux/ppc64le", "powerpc64le-unknown-linux-gnu")
+            | ("linux/riscv64", "riscv64gc-unknown-linux-gnu")
+            | ("linux/s390x", "s390x-unknown-linux-gnu") => true,
+            ("linux/arm/v6", "arm-unknown-linux-gnueabi") if target.is_armv6() => {
+                note_host_target_detection(msg_info)?;
+                true
+            }
+            ("linux/arm" | "linux/arm/v7", "armv7-unknown-linux-gnueabihf")
+                if target.is_armv7() =>
+            {
+                note_host_target_detection(msg_info)?;
+                true
+            }
+            _ => false,
+        },
+        Some(_) => false,
+    })
+}
+
 pub fn determine_image_name(
-    target: &crate::ImageTarget,
+    target: &ImageTarget,
     repository: &str,
     ref_type: &str,
     ref_name: &str,
@@ -370,7 +416,7 @@ pub fn determine_image_name(
 }
 
 pub fn job_summary(
-    results: &[Result<crate::ImageTarget, (crate::ImageTarget, eyre::ErrReport)>],
+    results: &[Result<ImageTarget, (ImageTarget, eyre::ErrReport)>],
 ) -> cross::Result<String> {
     let mut summary = "# SUMMARY\n\n".to_string();
     let success: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();

@@ -3,6 +3,12 @@
 
 purge_list=()
 
+set_centos_ulimit() {
+    # this is a bug affecting buildkit with yum when ulimit is unlimited
+    # https://github.com/docker/buildx/issues/379#issuecomment-1196517905
+    ulimit -n 1024000
+}
+
 install_packages() {
     if grep -i debian /etc/os-release; then
         apt-get update
@@ -15,6 +21,7 @@ install_packages() {
             fi
         done
     else
+        set_centos_ulimit
         for pkg in "${@}"; do
             if ! yum list installed "${pkg}" >/dev/null 2>/dev/null; then
                 yum install -y "${pkg}"
@@ -85,4 +92,73 @@ download_gcc() {
     local filename="gcc-${version}.tar.${ext}"
 
     download_mirrors "gcc/gcc-${version}" "${filename}" "${GNU_MIRRORS[@]}"
+}
+
+docker_to_qemu_arch() {
+    local arch="${1}"
+    case "${arch}" in
+        arm64)
+            echo "aarch64"
+            ;;
+        386)
+            echo "i386"
+            ;;
+        amd64)
+            echo "x86_64"
+            ;;
+        arm|ppc64le|riscv64|s390x)
+            echo "${arch}"
+            ;;
+        *)
+            echo "Unknown Docker image architecture, got \"${arch}\"." >&2
+            exit 1
+            ;;
+    esac
+}
+
+docker_to_linux_arch() {
+    # variant may not be provided
+    local oldstate
+    oldstate="$(set +o)"
+    set +u
+
+    local arch="${1}"
+    local variant="${2}"
+    case "${arch}" in
+        arm64)
+            echo "aarch64"
+            ;;
+        386)
+            echo "i686"
+            ;;
+        amd64)
+            echo "x86_64"
+            ;;
+        ppc64le)
+            echo "powerpc64le"
+            ;;
+        arm)
+            case "${variant}" in
+                v6)
+                    echo "arm"
+                    ;;
+                ""|v7)
+                    echo "armv7"
+                    ;;
+                *)
+                    echo "Unknown Docker image variant, got \"${variant}\"." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        riscv64|s390x)
+            echo "${arch}"
+            ;;
+        *)
+            echo "Unknown Docker image architecture, got \"${arch}\"." >&2
+            exit 1
+            ;;
+    esac
+
+    eval "${oldstate}"
 }

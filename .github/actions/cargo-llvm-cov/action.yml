@@ -31,19 +31,18 @@ runs:
           echo LLVM_PROFILE_FILE="${pwd}/target/cross-%m.profraw" >> $GITHUB_ENV
           echo CARGO_INCREMENTAL="0" >> $GITHUB_ENV
           echo RUST_TEST_THREADS="1" >> $GITHUB_ENV
-          echo "::set-output name=artifact-name::_coverage-${name}"
+          echo "artifact-name=_coverage-${name}" >> $GITHUB_OUTPUT
         post: |
           # XXX(emilgardis): Upload early?
           pwd=$(pwd)
           if which cygpath; then
             pwd="$(cygpath -w "$(pwd)")"
           fi
-          # No pwd needed here, we're in the root
           export LLVM_PROFILE_FILE="${pwd}/target/cross-%m.profraw"
           export CARGO_LLVM_COV_TARGET_DIR="${pwd}/target"
           mkdir coverage
           echo $(ls target)
-          cargo llvm-cov --no-run --remap-path-prefix --lcov --output-path "coverage/lcov.${name}.info" -vv || ( echo "::error title=Coverage merge failed::" && exit 0 )
+          cargo llvm-cov report --remap-path-prefix --lcov --output-path "coverage/lcov.${name}.info" -vv || ( echo "::error title=Coverage merge failed::" && exit 0 )
           rm target/*.profraw
           npm install @actions/artifact
           npm install glob

@@ -57,7 +57,7 @@ max_kernel_version() {
 main() {
     # arch in the rust target
     local arch="${1}" \
-          kversion=5.10.0-16
+        kversion=5.10.0-16
 
     local debsource="deb http://http.debian.net/debian/ bullseye main"
     debsource="${debsource}\ndeb http://security.debian.org/ bullseye-security main"
@@ -78,7 +78,7 @@ main() {
             ;;
         armv7)
             arch=armhf
-            kernel="5.*-armmp"
+            kernel='5.*-armmp'
             deps=(libcrypt1:"${arch}")
             ;;
         i686)
@@ -91,15 +91,15 @@ main() {
             libgcc="libgcc1"
             debsource="deb http://http.debian.net/debian/ buster main"
             debsource="${debsource}\ndeb http://security.debian.org/ buster/updates main"
-            kernel="4.*-4kc-malta"
+            kernel='4.*-4kc-malta'
             ncurses="=6.1*"
             ;;
         mipsel)
-            kernel="5.*-4kc-malta"
+            kernel='5.*-4kc-malta'
             deps=(libcrypt1:"${arch}")
             ;;
         mips64el)
-            kernel="5.*-5kc-malta"
+            kernel='5.*-5kc-malta'
             deps=(libcrypt1:"${arch}")
             ;;
         powerpc)
@@ -123,7 +123,7 @@ main() {
             # there is no stable port
             arch=ppc64
             # https://packages.debian.org/en/sid/linux-image-powerpc64
-            kernel='5.*-powerpc64'
+            kernel='6.*-powerpc64'
             debsource="deb http://ftp.ports.debian.org/debian-ports unstable main"
             debsource="${debsource}\ndeb http://ftp.ports.debian.org/debian-ports unreleased main"
             # sid version of dropbear requires these dependencies
@@ -131,24 +131,24 @@ main() {
             ;;
         powerpc64le)
             arch=ppc64el
-            kernel="5.*-powerpc64le"
+            kernel='5.*-powerpc64le'
             deps=(libcrypt1:"${arch}")
             ;;
         riscv64)
-            kernel="5.*-riscv64"
+            kernel='6.*-riscv64'
             debsource="deb http://ftp.ports.debian.org/debian-ports unstable main"
             debsource="${debsource}\ndeb http://ftp.ports.debian.org/debian-ports unreleased main"
             deps=(libcrypt1:"${arch}")
             ;;
         s390x)
             arch=s390x
-            kernel="5.*-s390x"
+            kernel='5.*-s390x'
             deps=(libcrypt1:"${arch}")
             ;;
         sparc64)
             # there is no stable port
             # https://packages.debian.org/en/sid/linux-image-sparc64
-            kernel='5.*-sparc64'
+            kernel='6.*-sparc64'
             debsource="deb http://ftp.ports.debian.org/debian-ports unstable main"
             debsource="${debsource}\ndeb http://ftp.ports.debian.org/debian-ports unreleased main"
             # sid version of dropbear requires these dependencies
@@ -171,12 +171,14 @@ main() {
         sharutils \
         gnupg
 
-    # amd64 has conflicting versions of the packages installed, so
+    # conflicting versions of some packages will be installed already for the host platform,
     # we need to remove the system installs later. since apt relies
     # on these packages, we need to download them and reinstall
     # using dpkg later, since we cannot redownload via apt.
+    local dpkg_arch
+    dpkg_arch=$(dpkg --print-architecture)
     local libgcc_packages=("${libgcc}:${arch}" "libstdc++6:${arch}")
-    if [[ "${arch}" == "amd64" ]]; then
+    if [[ "${arch}" == "${dpkg_arch}" ]]; then
         local libgcc_root=/qemu/libgcc
         mkdir -p "${libgcc_root}"
         pushd "${libgcc_root}"
@@ -186,6 +188,7 @@ main() {
 
     # Download packages
     mv /etc/apt/sources.list /etc/apt/sources.list.bak
+    mv /etc/apt/sources.list.d /etc/apt/sources.list.d.bak
     echo -e "${debsource}" > /etc/apt/sources.list
 
     # Old ubuntu does not support --add-architecture, so we directly change multiarch file
@@ -201,8 +204,8 @@ main() {
     curl --retry 3 -sSfL 'https://www.ports.debian.org/archive_{2020,2021,2022}.key' -O
 
     for key in *.asc *.key; do
-      apt-key add "${key}"
-      rm "${key}"
+        apt-key add "${key}"
+        rm "${key}"
     done
 
     # allow apt-get to retry downloads
@@ -240,10 +243,10 @@ main() {
         ncurses-base"${ncurses}" \
         "zlib1g:${arch}"
 
-    if [[ "${arch}" != "amd64" ]]; then
+    if [[ "${arch}" != "${dpkg_arch}" ]]; then
         apt-get -d --no-install-recommends download "${libgcc_packages[@]}"
     else
-        # amd64 has conflicting versions of the packages installed
+        # host arch has conflicting versions of the packages installed
         # this prevents us from downloading them, so we need to
         # simply grab the last version from the debian sources.
         # we're search for a paragraph with:
@@ -380,7 +383,7 @@ EOF
     find . | cpio --create --format='newc' --quiet | gzip > ../initrd.gz
     cd -
 
-    if [[ "${arch}" == "amd64" ]]; then
+    if [[ "${arch}" == "${dpkg_arch}" ]]; then
         # need to reinstall these packages, since basic utilities rely on them.
         pushd "${libgcc_root}"
         dpkg -i --force-depends "${libgcc_root}"/*.deb
@@ -391,15 +394,16 @@ EOF
     # Clean up
     rm -rf "/qemu/${root}" "/qemu/${arch}"
     mv -f /etc/apt/sources.list.bak /etc/apt/sources.list
+    mv -f /etc/apt/sources.list.d.bak /etc/apt/sources.list.d
     if [ -f /etc/dpkg/dpkg.cfg.d/multiarch.bak ]; then
         mv /etc/dpkg/dpkg.cfg.d/multiarch.bak /etc/dpkg/dpkg.cfg.d/multiarch
     fi
-    # can fail if arch is used (amd64 and/or i386)
+    # can fail if arch is used (image arch, such as amd64 and/or i386)
     dpkg --remove-architecture "${arch}" || true
     apt-get update
 
     # need to reinstall the removed libgcc packages, which are required for apt
-    if [[ "${arch}" == "amd64" ]]; then
+    if [[ "${arch}" == "${dpkg_arch}" ]]; then
         apt-get install --no-install-recommends --assume-yes "${packages[@]}"
     fi
 

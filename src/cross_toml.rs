@@ -143,8 +143,8 @@ impl CrossToml {
         toml_str: &str,
         msg_info: &mut MessageInfo,
     ) -> Result<(Self, BTreeSet<String>)> {
-        let mut tomld = toml::Deserializer::new(toml_str);
-        Self::parse_from_deserializer(&mut tomld, msg_info)
+        let tomld = toml::Deserializer::new(toml_str);
+        Self::parse_from_deserializer(tomld, msg_info)
     }
 
     /// Parses the [`CrossToml`] from a string containing the Cargo.toml contents
@@ -251,7 +251,7 @@ impl CrossToml {
         }
 
         // Builds maps of objects
-        let mut self_map = to_map(&self)?;
+        let mut self_map = to_map(self)?;
         let other_map = to_map(other)?;
 
         merge_objects(&mut self_map, &other_map).ok_or_else(|| eyre::eyre!("could not merge"))?;
@@ -852,6 +852,29 @@ mod tests {
             panic!("Parsing result is None");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    pub fn fully_populated_roundtrip() -> Result<()> {
+        let cfg = r#"
+            [target.a]
+            xargo = false
+            build-std = true
+            image.name = "local"
+            image.toolchain = ["x86_64-unknown-linux-gnu"]
+            dockerfile.file = "Dockerfile"
+            dockerfile.context = ".."
+            pre-build = ["sh"]
+            zig = true
+
+            [target.b]
+            pre-build = "sh"
+            zig = "2.17"
+        "#;
+
+        let (cfg, _) = CrossToml::parse_from_cross(cfg, &mut m!())?;
+        serde_json::from_value::<CrossToml>(serde_json::to_value(cfg)?)?;
         Ok(())
     }
 

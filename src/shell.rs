@@ -6,7 +6,9 @@ use std::fmt;
 use std::io::{self, Write};
 use std::str::FromStr;
 
+use crate::config::bool_from_envvar;
 use crate::errors::Result;
+use is_terminal::IsTerminal;
 use owo_colors::{self, OwoColorize};
 
 // get the prefix for stderr messages
@@ -39,8 +41,11 @@ macro_rules! message {
     (@status $stream:ident, $status:expr, $message:expr, $color:ident, $msg_info:expr $(,)?) => {{
         write_style!($stream, $msg_info, $status, bold, $color);
         write_style!($stream, $msg_info, ":", bold);
+        if let Some(caller) = $msg_info.caller() {
+            write!($stream, " [{}]", caller)?;
+        }
         match $message {
-            Some(message) => writeln!($stream, " {}", message)?,
+            Some(message) => writeln!($stream, " {}", message, )?,
             None => write!($stream, " ")?,
         }
 
@@ -65,9 +70,10 @@ macro_rules! status {
 }
 
 /// the requested verbosity of output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
     Quiet,
+    #[default]
     Normal,
     Verbose(u8),
 }
@@ -97,12 +103,6 @@ impl Verbosity {
             (0, true) => Some(Verbosity::Quiet),
             (0, false) => None,
         }
-    }
-}
-
-impl Default for Verbosity {
-    fn default() -> Verbosity {
-        Verbosity::Normal
     }
 }
 
@@ -139,15 +139,20 @@ pub struct MessageInfo {
     pub verbosity: Verbosity,
     pub stdout_needs_erase: bool,
     pub stderr_needs_erase: bool,
+    pub cross_debug: bool,
 }
 
 impl MessageInfo {
-    pub const fn new(color_choice: ColorChoice, verbosity: Verbosity) -> MessageInfo {
+    pub fn new(color_choice: ColorChoice, verbosity: Verbosity) -> MessageInfo {
         MessageInfo {
             color_choice,
             verbosity,
             stdout_needs_erase: false,
             stderr_needs_erase: false,
+            cross_debug: std::env::var("CROSS_DEBUG")
+                .as_deref()
+                .map(bool_from_envvar)
+                .unwrap_or_default(),
         }
     }
 
@@ -155,12 +160,17 @@ impl MessageInfo {
         let color_choice = get_color_choice(color)?;
         let verbosity = get_verbosity(color_choice, verbose, quiet)?;
 
-        Ok(MessageInfo {
-            color_choice,
-            verbosity,
-            stdout_needs_erase: false,
-            stderr_needs_erase: false,
-        })
+        Ok(Self::new(color_choice, verbosity))
+    }
+
+    #[track_caller]
+    pub fn caller(&mut self) -> Option<impl fmt::Display> {
+        if self.cross_debug {
+            let loc = std::panic::Location::caller();
+            Some(format!("{}:{}", loc.file(), loc.line()))
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -211,6 +221,7 @@ impl MessageInfo {
     }
 
     /// prints a red 'error' message and terminates.
+    #[track_caller]
     pub fn fatal<T: fmt::Display>(&mut self, message: T, code: i32) -> ! {
         self.error(message)
             .expect("could not display fatal message");
@@ -218,12 +229,14 @@ impl MessageInfo {
     }
 
     /// prints a red 'error' message.
+    #[track_caller]
     pub fn error<T: fmt::Display>(&mut self, message: T) -> Result<()> {
         self.stderr_check_erase()?;
         status!(@stderr cross_prefix!("error"), Some(&message), red, self)
     }
 
     /// prints an amber 'warning' message.
+    #[track_caller]
     pub fn warn<T: fmt::Display>(&mut self, message: T) -> Result<()> {
         match self.verbosity {
             Verbosity::Quiet => Ok(()),
@@ -237,6 +250,7 @@ impl MessageInfo {
     }
 
     /// prints a cyan 'note' message.
+    #[track_caller]
     pub fn note<T: fmt::Display>(&mut self, message: T) -> Result<()> {
         match self.verbosity {
             Verbosity::Quiet => Ok(()),
@@ -255,6 +269,7 @@ impl MessageInfo {
     }
 
     /// prints a high-priority message to stdout.
+    #[track_caller]
     pub fn print<T: fmt::Display>(&mut self, message: T) -> Result<()> {
         self.stdout_check_erase()?;
         println!("{}", message);
@@ -262,6 +277,7 @@ impl MessageInfo {
     }
 
     /// prints a normal message to stdout.
+    #[track_caller]
     pub fn info<T: fmt::Display>(&mut self, message: T) -> Result<()> {
         match self.verbosity {
             Verbosity::Quiet => Ok(()),
@@ -273,6 +289,7 @@ impl MessageInfo {
     }
 
     /// prints a debugging message to stdout.
+    #[track_caller]
     pub fn debug<T: fmt::Display>(&mut self, message: T) -> Result<()> {
         match self.verbosity {
             Verbosity::Quiet | Verbosity::Normal => Ok(()),
@@ -420,13 +437,11 @@ fn get_verbosity(
 }
 
 pub trait Stream {
-    const TTY: atty::Stream;
+    type TTY: IsTerminal;
     const OWO: owo_colors::Stream;
 
     #[must_use]
-    fn is_atty() -> bool {
-        atty::is(Self::TTY)
-    }
+    fn is_atty() -> bool;
 
     fn owo(&self) -> owo_colors::Stream {
         Self::OWO
@@ -434,18 +449,30 @@ pub trait Stream {
 }
 
 impl Stream for io::Stdin {
-    const TTY: atty::Stream = atty::Stream::Stdin;
+    type TTY = io::Stdin;
     const OWO: owo_colors::Stream = owo_colors::Stream::Stdin;
+
+    fn is_atty() -> bool {
+        io::stdin().is_terminal()
+    }
 }
 
 impl Stream for io::Stdout {
-    const TTY: atty::Stream = atty::Stream::Stdout;
+    type TTY = io::Stdout;
     const OWO: owo_colors::Stream = owo_colors::Stream::Stdout;
+
+    fn is_atty() -> bool {
+        io::stdout().is_terminal()
+    }
 }
 
 impl Stream for io::Stderr {
-    const TTY: atty::Stream = atty::Stream::Stderr;
+    type TTY = io::Stderr;
     const OWO: owo_colors::Stream = owo_colors::Stream::Stderr;
+
+    fn is_atty() -> bool {
+        io::stderr().is_terminal()
+    }
 }
 
 pub fn default_ident() -> usize {

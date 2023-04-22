@@ -7,7 +7,7 @@ use crate::shell::MessageInfo;
 use crate::{errors::*, file, CommandExt, ToUtf8};
 use crate::{CargoMetadata, TargetTriple};
 
-use super::{get_image_name, parse_docker_opts, path_hash, ImagePlatform};
+use super::{get_image_name, path_hash, BuildCommandExt, BuildResultExt, Engine, ImagePlatform};
 
 pub const CROSS_CUSTOM_DOCKERFILE_IMAGE_PREFIX: &str = "localhost/cross-rs/cross-custom-";
 
@@ -25,7 +25,7 @@ pub enum Dockerfile<'a> {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub enum PreBuild {
     /// A path to a file to copy or a single line to `RUN` if line comes from env
     Single { line: String, env: bool },
@@ -33,6 +33,21 @@ pub enum PreBuild {
     Lines(Vec<String>),
 }
 
+impl serde::Serialize for PreBuild {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PreBuild::Single { line, .. } => serializer.serialize_str(line),
+            PreBuild::Lines(lines) => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(lines.len()))?;
+                for line in lines {
+                    seq.serialize_element(line)?;
+                }
+                seq.end()
+            }
+        }
+    }
+}
 impl FromStr for PreBuild {
     type Err = std::convert::Infallible;
 
@@ -71,31 +86,15 @@ impl<'a> Dockerfile<'a> {
         msg_info: &mut MessageInfo,
     ) -> Result<String> {
         let uses_zig = options.cargo_variant.uses_zig();
-        let mut docker_build = docker::command(&options.engine);
-        match docker::Engine::has_buildkit() {
-            true => docker_build.args(["buildx", "build"]),
-            false => docker_build.arg("build"),
-        };
-        docker_build.env("DOCKER_SCAN_SUGGEST", "false");
+        let mut docker_build = options.engine.command();
+        docker_build.invoke_build_command();
+        docker_build.disable_scan_suggest();
         self.runs_with()
             .specify_platform(&options.engine, &mut docker_build);
 
-        docker_build.args([
-            "--label",
-            &format!(
-                "{}.for-cross-target={}",
-                crate::CROSS_LABEL_DOMAIN,
-                options.target,
-            ),
-        ]);
-        docker_build.args([
-            "--label",
-            &format!(
-                "{}.runs-with={}",
-                crate::CROSS_LABEL_DOMAIN,
-                self.runs_with().target
-            ),
-        ]);
+        docker_build.progress(None)?;
+        docker_build.verbose(msg_info.verbosity);
+        docker_build.cross_labels(options.target.triple(), self.runs_with().target.triple());
 
         docker_build.args([
             "--label",
@@ -144,10 +143,14 @@ impl<'a> Dockerfile<'a> {
             }
         }
 
+        // note that this is always relative to the PWD: if we have
+        // `$workspace_root/Dockerfile`, then running a build
+        // `PWD=$workspace_root/src/ cross build` would require
+        //  the Dockerfile path to be specified as `../Dockerfile`.
         docker_build.args(["--file".into(), path]);
 
         if let Some(build_opts) = options.config.build_opts() {
-            docker_build.args(parse_docker_opts(&build_opts)?);
+            docker_build.args(Engine::parse_opts(&build_opts)?);
         }
 
         let has_output = options.config.build_opts().map_or(false, |opts| {
@@ -163,7 +166,13 @@ impl<'a> Dockerfile<'a> {
             docker_build.arg(paths.host_root());
         }
 
-        docker_build.run(msg_info, true)?;
+        // FIXME: Inspect the error message, while still inheriting stdout on verbose mode to
+        // conditionally apply this suggestion and note. This could then inspect if a help string is emitted,
+        // if the daemon is not running, etc.
+        docker_build
+            .run(msg_info, true)
+            .engine_warning(&options.engine)
+            .buildkit_warning()?;
         Ok(image_name)
     }
 
@@ -180,7 +189,7 @@ impl<'a> Dockerfile<'a> {
                 "{}{package_name}:{target_triple}-{path_hash}{custom}",
                 CROSS_CUSTOM_DOCKERFILE_IMAGE_PREFIX,
                 package_name = docker_package_name(metadata),
-                path_hash = path_hash(&metadata.workspace_root)?,
+                path_hash = path_hash(&metadata.workspace_root, docker::PATH_HASH_SHORT)?,
                 custom = if matches!(self, Self::File { .. }) {
                     ""
                 } else {
@@ -234,7 +243,7 @@ fn docker_tag_name(file_name: &str) -> String {
     let mut consecutive_underscores = 0;
     for c in file_name.chars() {
         match c {
-            'a'..='z' | '.' | '-' => {
+            'a'..='z' | '0'..='9' | '.' | '-' => {
                 consecutive_underscores = 0;
                 result.push(c);
             }
@@ -253,7 +262,12 @@ fn docker_tag_name(file_name: &str) -> String {
         }
     }
 
-    // in case all characters were invalid, use a non-empty filename
+    // in case our result ends in an invalid last char `-` or `.`
+    // we remove
+    result = result.trim_end_matches(&['.', '-']).to_owned();
+
+    // in case all characters were invalid or we had all non-ASCII
+    // characters followed by a `-` or `.`, we use a non-empty filename
     if result.is_empty() {
         result = "empty".to_owned();
     }
@@ -287,5 +301,8 @@ mod tests {
             docker_tag_name("pAcKaGe---test.name"),
             s!("package---test.name")
         );
+
+        assert_eq!(docker_tag_name("foo-123"), s!("foo-123"));
+        assert_eq!(docker_tag_name("foo-123-"), s!("foo-123"));
     }
 }

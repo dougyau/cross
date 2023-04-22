@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -109,8 +110,9 @@ pub fn get_matrix() -> &'static Vec<CiTarget> {
     }
     MATRIX
         .get_or_try_init::<_, eyre::Report>(|| {
-            let targets: Targets =
-                toml::from_slice(&std::fs::read(get_cargo_workspace().join("targets.toml"))?)?;
+            let targets: Targets = toml::from_str(std::str::from_utf8(&std::fs::read(
+                get_cargo_workspace().join("targets.toml"),
+            )?)?)?;
             Ok(targets.target)
         })
         .unwrap()
@@ -133,7 +135,7 @@ pub fn pull_image(
     image: &str,
     msg_info: &mut MessageInfo,
 ) -> cross::Result<()> {
-    let mut command = docker::subcommand(engine, "pull");
+    let mut command = engine.subcommand("pull");
     command.arg(image);
     let out = command.run_and_get_output(msg_info)?;
     command.status_result(msg_info, out.status, Some(&out))?;
@@ -187,6 +189,20 @@ impl ImageTarget {
     /// Determine if this target needs to interact with the project root.
     pub fn needs_workspace_root_context(&self) -> bool {
         self.name == "cross"
+    }
+
+    pub fn is_armv6(&self) -> bool {
+        matches!(
+            self.name.as_str(),
+            "arm-unknown-linux-gnueabi" | "arm-unknown-linux-musleabi"
+        )
+    }
+
+    pub fn is_armv7(&self) -> bool {
+        matches!(
+            self.name.as_str(),
+            "armv7-unknown-linux-gnueabihf" | "armv7-unknown-linux-musleabihf"
+        )
     }
 }
 
@@ -262,23 +278,33 @@ pub fn project_dir(msg_info: &mut MessageInfo) -> cross::Result<PathBuf> {
     Ok(cargo_metadata(msg_info)?.workspace_root)
 }
 
+macro_rules! gha_output {
+    ($fmt:literal$(, $args:expr)* $(,)?) => {
+        #[cfg(not(test))]
+        println!($fmt $(, $args)*);
+        #[cfg(test)]
+        eprintln!($fmt $(,$args)*);
+    };
+}
+
 // note: for GHA actions we need to output these tags no matter the verbosity level
 pub fn gha_print(content: &str) {
-    println!("{}", content)
+    gha_output!("{}", content);
 }
 
 // note: for GHA actions we need to output these tags no matter the verbosity level
 pub fn gha_error(content: &str) {
-    println!("::error {}", content)
+    gha_output!("::error {}", content);
 }
 
 #[track_caller]
-pub fn gha_output(tag: &str, content: &str) {
+pub fn gha_output(tag: &str, content: &str) -> cross::Result<()> {
     if content.contains('\n') {
         // https://github.com/actions/toolkit/issues/403
-        panic!("output `{tag}` contains newlines, consider serializing with json and deserializing in gha with fromJSON()")
+        eyre::bail!("output `{tag}` contains newlines, consider serializing with json and deserializing in gha with fromJSON()");
     }
-    println!("::set-output name={tag}::{}", content)
+    write_to_gha_env_file("GITHUB_OUTPUT", &format!("{tag}={content}"))?;
+    Ok(())
 }
 
 pub fn read_dockerfiles(msg_info: &mut MessageInfo) -> cross::Result<Vec<(PathBuf, String)>> {
@@ -385,6 +411,15 @@ pub fn write_to_string(path: &Path, contents: &str) -> cross::Result<()> {
         .truncate(true)
         .create(true)
         .open(path)?;
+    writeln!(file, "{}", contents)?;
+    Ok(())
+}
+
+// https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#environment-files
+pub fn write_to_gha_env_file(env_name: &str, contents: &str) -> cross::Result<()> {
+    let path = env::var(env_name)?;
+    let path = Path::new(&path);
+    let mut file = fs::OpenOptions::new().append(true).open(path)?;
     writeln!(file, "{}", contents)?;
     Ok(())
 }

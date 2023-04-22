@@ -54,6 +54,7 @@ build_static_libattr() {
 
     pushd "${td}"
 
+    set_centos_ulimit
     yum install -y gettext
 
     curl --retry 3 -sSfL "https://download.savannah.nongnu.org/releases/attr/attr-${version}.src.tar.gz" -O
@@ -114,7 +115,7 @@ main() {
     if_centos version=4.2.1
 
     local arch="${1}" \
-          softmmu="${2:-}"
+        softmmu="${2:-}"
 
     install_packages \
         autoconf \

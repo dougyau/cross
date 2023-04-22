@@ -98,7 +98,7 @@ pub fn main() -> cross::Result<()> {
             target_info::target_info(args, &engine, &mut msg_info)?;
         }
         Commands::BuildDockerImage(args) => {
-            let mut msg_info = get_msg_info!(args, args.verbose != 0)?;
+            let mut msg_info = get_msg_info!(args, args.verbose)?;
             let engine = get_engine!(args, msg_info)?;
             build_docker_image::build_docker_image(args, &engine, &mut msg_info)?;
         }
@@ -112,7 +112,7 @@ pub fn main() -> cross::Result<()> {
         }
         Commands::Test(args) => {
             let mut msg_info = get_msg_info!(args, args.verbose)?;
-            hooks::test(cli.toolchain.as_deref(), &mut msg_info)?;
+            hooks::test(args, cli.toolchain.as_deref(), &mut msg_info)?;
         }
         Commands::CiJob(args) => {
             let metadata = cargo_metadata(&mut Verbosity::Verbose(2).into())?;

@@ -31,6 +31,9 @@ pub enum CiJob {
         message: String,
         #[clap(long, env = "COMMIT_AUTHOR")]
         author: String,
+        // check is being run as part of a weekly check
+        #[clap(long)]
+        weekly: bool,
     },
 }
 
@@ -63,7 +66,7 @@ pub fn ci(args: CiJob, metadata: CargoMetadata) -> cross::Result<()> {
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
             ));
 
-            gha_output("labels", &serde_json::to_string(&labels.join("\n"))?);
+            gha_output("labels", &serde_json::to_string(&labels.join("\n"))?)?;
 
             let version = cross_meta.version.clone();
 
@@ -78,15 +81,15 @@ pub fn ci(args: CiJob, metadata: CargoMetadata) -> cross::Result<()> {
                     false,
                     &version,
                 )?[0],
-            );
+            )?;
 
             if target.has_ci_image() {
-                gha_output("has-image", "true")
+                gha_output("has-image", "true")?
             }
             if target.is_standard_target_image() {
-                gha_output("test-variant", "default")
+                gha_output("test-variant", "default")?
             } else {
-                gha_output("test-variant", &target.name)
+                gha_output("test-variant", &target.name)?
             }
         }
         CiJob::Check { ref_type, ref_name } => {
@@ -110,12 +113,16 @@ pub fn ci(args: CiJob, metadata: CargoMetadata) -> cross::Result<()> {
                         .ok_or_else(|| eyre::eyre!("cargo search returned unexpected data"))?,
                 )?;
                 if version >= latest_version && version.pre.is_empty() {
-                    gha_output("is-latest", "true")
+                    gha_output("is-latest", "true")?
                 }
             }
         }
-        CiJob::TargetMatrix { message, author } => {
-            target_matrix::run(message, author)?;
+        CiJob::TargetMatrix {
+            message,
+            author,
+            weekly,
+        } => {
+            target_matrix::run(message, author, weekly)?;
         }
     }
     Ok(())

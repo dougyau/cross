@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use color_eyre::owo_colors::OwoColorize;
-use color_eyre::SectionExt;
 use rustc_version::{Channel, Version};
 
 use crate::errors::*;
@@ -28,6 +26,31 @@ impl AvailableTargets {
         let target = target.triple();
         target == self.default || self.installed.iter().any(|x| x == target)
     }
+}
+
+pub fn setup_rustup(
+    toolchain: &QualifiedToolchain,
+    msg_info: &mut MessageInfo,
+) -> Result<AvailableTargets, color_eyre::Report> {
+    if !toolchain.is_custom
+        && !installed_toolchains(msg_info)?
+            .into_iter()
+            .any(|t| t == toolchain.to_string())
+    {
+        install_toolchain(toolchain, msg_info)?;
+    }
+    let available_targets = if !toolchain.is_custom {
+        available_targets(&toolchain.full, msg_info).with_note(|| {
+            format!("cross would use the toolchain '{toolchain}' for mounting rust")
+        })?
+    } else {
+        AvailableTargets {
+            default: String::new(),
+            installed: vec![],
+            not_installed: vec![],
+        }
+    };
+    Ok(available_targets)
 }
 
 fn rustup_command(msg_info: &mut MessageInfo, no_flags: bool) -> Command {
@@ -93,14 +116,22 @@ pub fn available_targets(
         .suggestion("is rustup installed?")?;
 
     if !output.status.success() {
-        if String::from_utf8_lossy(&output.stderr).contains("is a custom toolchain") {
-            return Err(eyre::eyre!("`{toolchain}` is a custom toolchain.").with_section(|| r#"To use this toolchain with cross, you'll need to set the environment variable `CROSS_CUSTOM_TOOLCHAIN=1`
-cross will not attempt to configure the toolchain further so that it can run your binary."#.header("Suggestion".bright_cyan())));
-        }
-        return Err(cmd
+        let mut err = cmd
             .status_result(msg_info, output.status, Some(&output))
-            .unwrap_err()
-            .to_section_report());
+            .expect_err("we know the command failed")
+            .to_section_report();
+        if String::from_utf8_lossy(&output.stderr).contains("is a custom toolchain") {
+            err = err.wrap_err("'{toolchain}' is a custom toolchain.")
+            .suggestion(r#"To use this toolchain with cross, you'll need to set the environment variable `CROSS_CUSTOM_TOOLCHAIN=1`
+cross will not attempt to configure the toolchain further so that it can run your binary."#);
+        } else if String::from_utf8_lossy(&output.stderr).contains("does not support components") {
+            err = err.suggestion(format!(
+                "try reinstalling the '{toolchain}' toolchain
+$ rustup toolchain uninstall {toolchain}
+$ rustup toolchain install {toolchain} --force-non-host"
+            ));
+        }
+        return Err(err);
     }
     let out = output.stdout()?;
     let mut default = String::new();
@@ -235,6 +266,48 @@ pub fn component_is_installed(
     Ok(check_component(component, toolchain, msg_info)?.is_installed())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn setup_components(
+    target: &Target,
+    uses_xargo: bool,
+    uses_build_std: bool,
+    toolchain: &QualifiedToolchain,
+    is_nightly: bool,
+    available_targets: AvailableTargets,
+    args: &crate::cli::Args,
+    msg_info: &mut MessageInfo,
+) -> Result<(), color_eyre::Report> {
+    if !toolchain.is_custom {
+        // build-std overrides xargo, but only use it if it's a built-in
+        // tool but not an available target or doesn't have rust-std.
+
+        if !is_nightly && uses_build_std {
+            eyre::bail!(
+                "no rust-std component available for {}: must use nightly",
+                target.triple()
+            );
+        }
+
+        if !uses_xargo
+            && !uses_build_std
+            && !available_targets.is_installed(target)
+            && available_targets.contains(target)
+        {
+            install(target, toolchain, msg_info)?;
+        } else if !component_is_installed("rust-src", toolchain, msg_info)? {
+            install_component("rust-src", toolchain, msg_info)?;
+        }
+        if args
+            .subcommand
+            .map_or(false, |sc| sc == crate::Subcommand::Clippy)
+            && !component_is_installed("clippy", toolchain, msg_info)?
+        {
+            install_component("clippy", toolchain, msg_info)?;
+        }
+    }
+    Ok(())
+}
+
 fn rustc_channel(version: &Version) -> Result<Channel> {
     match version
         .pre
@@ -261,7 +334,7 @@ impl QualifiedToolchain {
         if path.exists() {
             let contents =
                 std::fs::read(&path).wrap_err_with(|| format!("couldn't open file `{path:?}`"))?;
-            let manifest: toml::value::Table = toml::from_slice(&contents)?;
+            let manifest: toml::value::Table = toml::from_str(std::str::from_utf8(&contents)?)?;
             return Ok(manifest
                 .get("pkg")
                 .and_then(|pkg| pkg.get("rust"))

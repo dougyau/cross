@@ -13,10 +13,10 @@ ci_dir=$(realpath "${ci_dir}")
 . "${ci_dir}"/shared.sh
 
 workspace_test() {
-  "${CROSS[@]}" build --target "${TARGET}" --workspace "$@" ${CROSS_FLAGS}
-  "${CROSS[@]}" run --target "${TARGET}" -p binary "$@" ${CROSS_FLAGS}
-  "${CROSS[@]}" run --target "${TARGET}" --bin dependencies \
-    --features=dependencies "$@" ${CROSS_FLAGS}
+    "${CROSS[@]}" build --target "${TARGET}" --workspace "$@" ${CROSS_FLAGS}
+    "${CROSS[@]}" run --target "${TARGET}" -p binary "$@" ${CROSS_FLAGS}
+    "${CROSS[@]}" run --target "${TARGET}" --bin dependencies \
+        --features=dependencies "$@" ${CROSS_FLAGS}
 }
 
 main() {
@@ -31,7 +31,8 @@ main() {
     export QEMU_STRACE=1
 
     # ensure we have the proper toolchain and optional rust flags
-    export CROSS=("${PROJECT_HOME}/target/debug/cross")
+    CROSS=$(binary_path cross "${PROJECT_HOME}" debug)
+    export CROSS=("${CROSS}")
     export CROSS_FLAGS="-v"
     if (( ${BUILD_STD:-0} )); then
         # use build-std instead of xargo, due to xargo being
@@ -67,12 +68,10 @@ main() {
         retry cargo fetch
         # don't use xargo: should have native support just from rustc
         rustup toolchain add nightly
-        "${CROSS[@]}" build --lib --target "${TARGET}" ${CROSS_FLAGS}
+        cross_build --lib --target "${TARGET}"
         popd
 
         rm -rf "${td}"
-
-        return
     fi
 
     # `cross build` test for the other targets
@@ -82,7 +81,7 @@ main() {
         pushd "${td}"
         cargo init --lib --name foo .
         retry cargo fetch
-        "${CROSS[@]}" build --target "${TARGET}" ${CROSS_FLAGS}
+        cross_build --target "${TARGET}"
         popd
 
         rm -rf "${td}"
@@ -93,7 +92,7 @@ main() {
         # test that linking works
         cargo init --bin --name hello .
         retry cargo fetch
-        "${CROSS[@]}" build --target "${TARGET}" ${CROSS_FLAGS}
+        cross_build --target "${TARGET}"
         popd
 
         rm -rf "${td}"
@@ -165,8 +164,22 @@ main() {
 
     fi
 
-    # Test C++ support
+    # Test C++ support in a no_std context
     if (( ${CPP:-0} )); then
+        td="$(mkcargotemp -d)"
+
+        git clone --depth 1 https://github.com/cross-rs/rust-cpp-accumulate "${td}"
+
+        pushd "${td}"
+        retry cargo fetch
+        cross_build --target "${TARGET}"
+        popd
+
+        rm -rf "${td}"
+    fi
+
+    # Test C++ support
+    if (( ${STD:-0} )) && (( ${CPP:-0} )); then
         td="$(mkcargotemp -d)"
 
         git clone --depth 1 https://github.com/cross-rs/rust-cpp-hello-word "${td}"
@@ -176,12 +189,60 @@ main() {
         if (( ${RUN:-0} )); then
             cross_run --target "${TARGET}"
         else
-            "${CROSS[@]}" build --target "${TARGET}" ${CROSS_FLAGS}
+            cross_build --target "${TARGET}"
         fi
         popd
 
         rm -rf "${td}"
     fi
+
+    # special tests for a shared C runtime, since we disable the shared c++ runtime
+    # https://github.com/cross-rs/cross/issues/902
+    if [[ "${TARGET}" == *-linux-musl* ]]; then
+        td=$(mkcargotemp -d)
+
+        pushd "${td}"
+        cargo init --bin --name hello .
+        retry cargo fetch
+        RUSTFLAGS="-C target-feature=-crt-static" \
+            cross_build --target "${TARGET}"
+        popd
+
+        rm -rf "${td}"
+    fi
+
+    # test cmake support
+    td="$(mkcargotemp -d)"
+
+    git clone \
+        --recursive \
+        --depth 1 \
+        https://github.com/cross-rs/rust-cmake-hello-world "${td}"
+
+    pushd "${td}"
+    retry cargo fetch
+    if [[ "${TARGET}" == "arm-linux-androideabi" ]]; then
+        # ARMv5te isn't supported anymore by Android, which produces missing
+        # symbol errors with re2 like `__libcpp_signed_lock_free`.
+        cross_run --target "${TARGET}" --features=tryrun
+    elif (( ${STD:-0} )) && (( ${RUN:-0} )) && (( ${CPP:-0} )); then
+        cross_run --target "${TARGET}" --features=re2,tryrun
+    elif (( ${STD:-0} )) && (( ${CPP:-0} )); then
+        cross_build --target "${TARGET}" --features=re2
+    elif (( ${STD:-0} )) && (( ${RUN:-0} )); then
+        cross_run --target "${TARGET}" --features=tryrun
+    elif (( ${STD:-0} )); then
+        cross_build --target "${TARGET}" --features=tryrun
+    else
+        cross_build --lib --target "${TARGET}"
+    fi
+    popd
+
+    rm -rf "${td}"
+}
+
+cross_build() {
+    "${CROSS[@]}" build "$@" ${CROSS_FLAGS}
 }
 
 cross_run() {

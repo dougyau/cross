@@ -1,34 +1,31 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{env, fs};
+use std::process::{Command, ExitStatus, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{env, fs, time};
 
 use super::custom::{Dockerfile, PreBuild};
 use super::engine::*;
 use super::image::PossibleImage;
 use super::Image;
 use super::PROVIDED_IMAGES;
-use crate::cargo::{cargo_metadata_with_args, CargoMetadata};
+use crate::cargo::CargoMetadata;
 use crate::config::{bool_from_envvar, Config};
 use crate::errors::*;
 use crate::extensions::{CommandExt, SafeCommand};
 use crate::file::{self, write_file, PathExt, ToUtf8};
 use crate::id;
 use crate::rustc::QualifiedToolchain;
-use crate::shell::{MessageInfo, Verbosity};
-use crate::{CargoVariant, Target};
+use crate::shell::{ColorChoice, MessageInfo, Verbosity};
+use crate::{CargoVariant, OutputExt, Target, TargetTriple};
+
+use rustc_version::Version as RustcVersion;
 
 pub use super::custom::CROSS_CUSTOM_DOCKERFILE_IMAGE_PREFIX;
 
 pub const CROSS_IMAGE: &str = "ghcr.io/cross-rs";
 // note: this is the most common base image for our images
 pub const UBUNTU_BASE: &str = "ubuntu:20.04";
-
-// secured profile based off the docker documentation for denied syscalls:
-// https://docs.docker.com/engine/security/seccomp/#significant-syscalls-blocked-by-the-default-profile
-// note that we've allow listed `clone` and `clone3`, which is necessary
-// to fork the process, and which podman allows by default.
-pub(crate) const SECCOMP: &str = include_str!("seccomp.json");
 
 #[derive(Debug)]
 pub struct DockerOptions {
@@ -37,6 +34,8 @@ pub struct DockerOptions {
     pub config: Config,
     pub image: Image,
     pub cargo_variant: CargoVariant,
+    // not all toolchains will provide this
+    pub rustc_version: Option<RustcVersion>,
 }
 
 impl DockerOptions {
@@ -46,6 +45,7 @@ impl DockerOptions {
         config: Config,
         image: Image,
         cargo_variant: CargoVariant,
+        rustc_version: Option<RustcVersion>,
     ) -> DockerOptions {
         DockerOptions {
             engine,
@@ -53,6 +53,7 @@ impl DockerOptions {
             config,
             image,
             cargo_variant,
+            rustc_version,
         }
     }
 
@@ -85,6 +86,9 @@ impl DockerOptions {
         msg_info: &mut MessageInfo,
     ) -> Result<String> {
         let mut image = self.image.clone();
+        if self.target.triple() == "arm-unknown-linux-gnueabihf" {
+            msg_info.note("cannot install armhf system packages via apt for `arm-unknown-linux-gnueabihf`, since they are for ARMv7a targets but this target is ARMv6. installation of all packages for the armhf architecture has been blocked.")?;
+        }
 
         if let Some(path) = self.config.dockerfile(&self.target)? {
             let context = self.config.dockerfile_context(&self.target)?;
@@ -199,8 +203,9 @@ impl DockerPaths {
         metadata: CargoMetadata,
         cwd: PathBuf,
         toolchain: QualifiedToolchain,
+        msg_info: &mut MessageInfo,
     ) -> Result<Self> {
-        let mount_finder = MountFinder::create(engine)?;
+        let mount_finder = MountFinder::create(engine, msg_info)?;
         let (directories, metadata) =
             Directories::assemble(&mount_finder, metadata, &cwd, toolchain)?;
         Ok(Self {
@@ -212,7 +217,7 @@ impl DockerPaths {
     }
 
     pub fn get_sysroot(&self) -> &Path {
-        self.directories.get_sysroot()
+        self.directories.toolchain_directories().get_sysroot()
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -235,37 +240,27 @@ impl DockerPaths {
     }
 
     pub fn mount_cwd(&self) -> &str {
-        &self.directories.mount_cwd
+        self.directories.package_directories().mount_cwd()
     }
 
     pub fn host_root(&self) -> &Path {
-        &self.directories.host_root
+        self.directories.package_directories().host_root()
     }
 }
 
 #[derive(Debug)]
-pub struct Directories {
-    pub cargo: PathBuf,
-    pub xargo: PathBuf,
-    pub target: PathBuf,
-    pub nix_store: Option<PathBuf>,
-    pub host_root: PathBuf,
-    // both mount fields are WSL paths on windows: they already are POSIX paths
-    pub mount_root: String,
-    pub mount_cwd: String,
-    pub toolchain: QualifiedToolchain,
-    pub cargo_mount_path: String,
-    pub xargo_mount_path: String,
-    pub sysroot_mount_path: String,
+pub struct ToolchainDirectories {
+    cargo: PathBuf,
+    xargo: PathBuf,
+    nix_store: Option<PathBuf>,
+    toolchain: QualifiedToolchain,
+    cargo_mount_path: String,
+    xargo_mount_path: String,
+    sysroot_mount_path: String,
 }
 
-impl Directories {
-    pub fn assemble(
-        mount_finder: &MountFinder,
-        mut metadata: CargoMetadata,
-        cwd: &Path,
-        mut toolchain: QualifiedToolchain,
-    ) -> Result<(Self, CargoMetadata)> {
+impl ToolchainDirectories {
+    pub fn assemble(mount_finder: &MountFinder, mut toolchain: QualifiedToolchain) -> Result<Self> {
         let home_dir =
             home::home_dir().ok_or_else(|| eyre::eyre!("could not find home directory"))?;
         let cargo = home::cargo_home()?;
@@ -275,7 +270,6 @@ impl Directories {
         let nix_store = env::var_os("NIX_STORE_DIR")
             .or_else(|| env::var_os("NIX_STORE"))
             .map(PathBuf::from);
-        let target = &metadata.target_directory;
 
         // create the directories we are going to mount before we mount them,
         // otherwise `docker` will create them but they will be owned by `root`
@@ -286,7 +280,6 @@ impl Directories {
         if let Some(ref nix_store) = nix_store {
             file::create_dir_all(nix_store)?;
         }
-        create_target_dir(target)?;
 
         // get our mount paths prior to canonicalizing them
         let cargo_mount_path = cargo.as_posix_absolute()?;
@@ -300,7 +293,7 @@ impl Directories {
         let default_nix_store = PathBuf::from("/nix/store");
         let nix_store = match nix_store {
             Some(store) if store.exists() => {
-                let path = file::canonicalize(&store)?;
+                let path = file::canonicalize(store)?;
                 Some(path)
             }
             Some(store) => {
@@ -314,49 +307,61 @@ impl Directories {
 
         let cargo = mount_finder.find_mount_path(cargo);
         let xargo = mount_finder.find_mount_path(xargo);
-        metadata.target_directory = mount_finder.find_mount_path(target);
-
-        // root is either workspace_root, or, if we're outside the workspace root, the current directory
-        let host_root = mount_finder.find_mount_path(if metadata.workspace_root.starts_with(cwd) {
-            cwd
-        } else {
-            &metadata.workspace_root
-        });
-
-        // on Windows, we can not mount the directory name directly. Instead, we use wslpath to convert the path to a linux compatible path.
-        // NOTE: on unix, host root has already found the mount path
-        let mount_root = host_root.as_posix_absolute()?;
-        let mount_cwd = mount_finder.find_path(cwd, false)?;
 
         toolchain.set_sysroot(|p| mount_finder.find_mount_path(p));
 
         // canonicalize these once to avoid syscalls
         let sysroot_mount_path = toolchain.get_sysroot().as_posix_absolute()?;
 
-        Ok((
-            Directories {
-                cargo,
-                xargo,
-                target: metadata.target_directory.clone(),
-                nix_store,
-                host_root,
-                mount_root,
-                mount_cwd,
-                toolchain,
-                cargo_mount_path,
-                xargo_mount_path,
-                sysroot_mount_path,
-            },
-            metadata,
-        ))
+        Ok(ToolchainDirectories {
+            cargo,
+            xargo,
+            nix_store,
+            toolchain,
+            cargo_mount_path,
+            xargo_mount_path,
+            sysroot_mount_path,
+        })
+    }
+
+    pub fn unique_toolchain_identifier(&self) -> Result<String> {
+        self.toolchain.unique_toolchain_identifier()
+    }
+
+    pub fn unique_container_identifier(&self, triple: &TargetTriple) -> Result<String> {
+        self.toolchain.unique_container_identifier(triple)
+    }
+
+    pub fn toolchain(&self) -> &QualifiedToolchain {
+        &self.toolchain
     }
 
     pub fn get_sysroot(&self) -> &Path {
         self.toolchain.get_sysroot()
     }
 
+    pub fn host_target(&self) -> &TargetTriple {
+        &self.toolchain.host().target
+    }
+
+    pub fn cargo(&self) -> &Path {
+        &self.cargo
+    }
+
+    pub fn cargo_host_path(&self) -> Result<&str> {
+        self.cargo.to_utf8()
+    }
+
     pub fn cargo_mount_path(&self) -> &str {
         &self.cargo_mount_path
+    }
+
+    pub fn xargo(&self) -> &Path {
+        &self.xargo
+    }
+
+    pub fn xargo_host_path(&self) -> Result<&str> {
+        self.xargo.to_utf8()
     }
 
     pub fn xargo_mount_path(&self) -> &str {
@@ -365,6 +370,10 @@ impl Directories {
 
     pub fn sysroot_mount_path(&self) -> &str {
         &self.sysroot_mount_path
+    }
+
+    pub fn nix_store(&self) -> Option<&Path> {
+        self.nix_store.as_deref()
     }
 
     pub fn cargo_mount_path_relative(&self) -> Result<String> {
@@ -389,6 +398,420 @@ impl Directories {
     }
 }
 
+#[derive(Debug)]
+pub struct PackageDirectories {
+    target: PathBuf,
+    host_root: PathBuf,
+    // both mount fields are WSL paths on windows: they already are POSIX paths
+    mount_root: String,
+    mount_cwd: String,
+}
+
+impl PackageDirectories {
+    pub fn assemble(
+        mount_finder: &MountFinder,
+        mut metadata: CargoMetadata,
+        cwd: &Path,
+    ) -> Result<(Self, CargoMetadata)> {
+        let target = &metadata.target_directory;
+        // see ToolchainDirectories::assemble for creating directories
+        create_target_dir(target)?;
+
+        metadata.target_directory = mount_finder.find_mount_path(target);
+
+        // root is either workspace_root, or, if we're outside the workspace root, the current directory
+        let host_root = mount_finder.find_mount_path(if metadata.workspace_root.starts_with(cwd) {
+            cwd
+        } else {
+            &metadata.workspace_root
+        });
+
+        // on Windows, we can not mount the directory name directly. Instead, we use wslpath to convert the path to a linux compatible path.
+        // NOTE: on unix, host root has already found the mount path
+        let mount_root = host_root.as_posix_absolute()?;
+        let mount_cwd = mount_finder.find_path(cwd, false)?;
+
+        Ok((
+            PackageDirectories {
+                target: metadata.target_directory.clone(),
+                host_root,
+                mount_root,
+                mount_cwd,
+            },
+            metadata,
+        ))
+    }
+
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    pub fn host_root(&self) -> &Path {
+        &self.host_root
+    }
+
+    pub fn mount_root(&self) -> &str {
+        &self.mount_root
+    }
+
+    pub fn mount_cwd(&self) -> &str {
+        &self.mount_cwd
+    }
+}
+
+#[derive(Debug)]
+pub struct Directories {
+    toolchain: ToolchainDirectories,
+    package: PackageDirectories,
+}
+
+impl Directories {
+    pub fn assemble(
+        mount_finder: &MountFinder,
+        metadata: CargoMetadata,
+        cwd: &Path,
+        toolchain: QualifiedToolchain,
+    ) -> Result<(Self, CargoMetadata)> {
+        let (package, metadata) = PackageDirectories::assemble(mount_finder, metadata, cwd)?;
+        let toolchain = ToolchainDirectories::assemble(mount_finder, toolchain)?;
+
+        Ok((Directories { toolchain, package }, metadata))
+    }
+
+    pub fn toolchain_directories(&self) -> &ToolchainDirectories {
+        &self.toolchain
+    }
+
+    pub fn package_directories(&self) -> &PackageDirectories {
+        &self.package
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ContainerState {
+    Created,
+    Running,
+    Paused,
+    Restarting,
+    Dead,
+    Exited,
+    DoesNotExist,
+}
+
+impl ContainerState {
+    pub fn new(state: &str) -> Result<Self> {
+        match state {
+            "created" => Ok(ContainerState::Created),
+            "running" => Ok(ContainerState::Running),
+            "paused" => Ok(ContainerState::Paused),
+            "restarting" => Ok(ContainerState::Restarting),
+            "dead" => Ok(ContainerState::Dead),
+            "exited" => Ok(ContainerState::Exited),
+            "" => Ok(ContainerState::DoesNotExist),
+            _ => eyre::bail!("unknown container state: got {state}"),
+        }
+    }
+
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Exited | Self::DoesNotExist)
+    }
+
+    #[must_use]
+    pub fn exists(&self) -> bool {
+        !matches!(self, Self::DoesNotExist)
+    }
+}
+
+// the mount directory for the data volume.
+pub const MOUNT_PREFIX: &str = "/cross";
+// the prefix used when naming volumes
+pub const VOLUME_PREFIX: &str = "cross-";
+// default timeout to stop a container (in seconds)
+pub const DEFAULT_TIMEOUT: u32 = 2;
+// instant kill in case of a non-graceful exit
+pub const NO_TIMEOUT: u32 = 0;
+
+pub(crate) static mut CHILD_CONTAINER: ChildContainer = ChildContainer::new();
+
+// the lack of [MessageInfo] is because it'd require a mutable reference,
+// since we don't need the functionality behind the [MessageInfo], we can just store the basic
+// MessageInfo configurations.
+pub(crate) struct ChildContainerInfo {
+    engine: Engine,
+    name: String,
+    timeout: u32,
+    color_choice: ColorChoice,
+    verbosity: Verbosity,
+}
+
+// we need to specify drops for the containers, but we
+// also need to ensure the drops are called on a
+// termination handler. we use an atomic bool to ensure
+// that the drop only gets called once, even if we have
+// the signal handle invoked multiple times or it fails.
+#[allow(missing_debug_implementations)]
+pub struct ChildContainer {
+    info: Option<ChildContainerInfo>,
+    exists: AtomicBool,
+}
+
+impl ChildContainer {
+    pub const fn new() -> ChildContainer {
+        ChildContainer {
+            info: None,
+            exists: AtomicBool::new(false),
+        }
+    }
+
+    pub fn create(engine: Engine, name: String) -> Result<()> {
+        // SAFETY: guarded by an atomic swap
+        unsafe {
+            if !CHILD_CONTAINER.exists.swap(true, Ordering::SeqCst) {
+                CHILD_CONTAINER.info = Some(ChildContainerInfo {
+                    engine,
+                    name,
+                    timeout: NO_TIMEOUT,
+                    color_choice: ColorChoice::Never,
+                    verbosity: Verbosity::Quiet,
+                });
+                Ok(())
+            } else {
+                eyre::bail!("attempted to create already existing container.");
+            }
+        }
+    }
+
+    // the static functions have been placed by the internal functions to
+    // verify the internal functions are wrapped in atomic load/stores.
+
+    pub fn exists(&self) -> bool {
+        self.exists.load(Ordering::SeqCst)
+    }
+
+    pub fn exists_static() -> bool {
+        // SAFETY: an atomic load.
+        unsafe { CHILD_CONTAINER.exists() }
+    }
+
+    // when the `docker run` command finished.
+    // the container has already exited, so no cleanup required.
+    pub fn exit(&mut self) {
+        self.exists.store(false, Ordering::SeqCst);
+    }
+
+    pub fn exit_static() {
+        // SAFETY: an atomic store.
+        unsafe {
+            CHILD_CONTAINER.exit();
+        }
+    }
+
+    // when the `docker exec` command finished.
+    pub fn finish(&mut self, is_tty: bool, msg_info: &mut MessageInfo) {
+        // relax the no-timeout and lack of output
+        // ensure we have atomic ordering
+        if self.exists() {
+            let info = self
+                .info
+                .as_mut()
+                .expect("since we're loaded and exist, child should not be terminated");
+            if is_tty {
+                info.timeout = DEFAULT_TIMEOUT;
+            }
+            info.color_choice = msg_info.color_choice;
+            info.verbosity = msg_info.verbosity;
+        }
+
+        self.terminate();
+    }
+
+    pub fn finish_static(is_tty: bool, msg_info: &mut MessageInfo) {
+        // SAFETY: internally guarded by an atomic load.
+        unsafe {
+            CHILD_CONTAINER.finish(is_tty, msg_info);
+        }
+    }
+
+    // terminate the container early. leaves the struct in a valid
+    // state, so it's async safe, but so the container will not
+    // be stopped again.
+    pub fn terminate(&mut self) {
+        if self.exists.swap(false, Ordering::SeqCst) {
+            let info = self.info.as_mut().expect(
+                "since we're loaded and exist, child should not have been terminated already",
+            );
+            let mut msg_info = MessageInfo::new(info.color_choice, info.verbosity);
+            let container = DockerContainer::new(&info.engine, &info.name);
+            container.stop(info.timeout, &mut msg_info).ok();
+            container.remove(&mut msg_info).ok();
+
+            self.info = None;
+        }
+    }
+}
+
+impl Drop for ChildContainer {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[derive(Debug)]
+pub struct ContainerDataVolume<'a, 'b, 'c> {
+    pub(crate) engine: &'a Engine,
+    pub(crate) container: &'b str,
+    pub(crate) toolchain_dirs: &'c ToolchainDirectories,
+}
+
+impl<'a, 'b, 'c> ContainerDataVolume<'a, 'b, 'c> {
+    pub const fn new(
+        engine: &'a Engine,
+        container: &'b str,
+        toolchain_dirs: &'c ToolchainDirectories,
+    ) -> Self {
+        Self {
+            engine,
+            container,
+            toolchain_dirs,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum VolumeId {
+    Keep(String),
+    Discard,
+}
+
+impl VolumeId {
+    pub fn mount(&self, mount_prefix: &str) -> String {
+        match self {
+            VolumeId::Keep(ref id) => format!("{id}:{mount_prefix}"),
+            VolumeId::Discard => mount_prefix.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DockerVolume<'a, 'b> {
+    pub(crate) engine: &'a Engine,
+    pub(crate) name: &'b str,
+}
+
+impl<'a, 'b> DockerVolume<'a, 'b> {
+    pub const fn new(engine: &'a Engine, name: &'b str) -> Self {
+        Self { engine, name }
+    }
+
+    #[track_caller]
+    pub fn create(&self, msg_info: &mut MessageInfo) -> Result<ExitStatus> {
+        self.engine
+            .run_and_get_status(&["volume", "create", self.name], msg_info)
+    }
+
+    #[track_caller]
+    pub fn remove(&self, msg_info: &mut MessageInfo) -> Result<ExitStatus> {
+        self.engine
+            .run_and_get_status(&["volume", "rm", self.name], msg_info)
+    }
+
+    #[track_caller]
+    pub fn exists(&self, msg_info: &mut MessageInfo) -> Result<bool> {
+        self.engine
+            .run_and_get_output(&["volume", "inspect", self.name], msg_info)
+            .map(|output| output.status.success())
+    }
+
+    #[track_caller]
+    pub fn existing(
+        engine: &Engine,
+        toolchain: &QualifiedToolchain,
+        msg_info: &mut MessageInfo,
+    ) -> Result<Vec<String>> {
+        let list = engine
+            .run_and_get_output(
+                &[
+                    "volume",
+                    "list",
+                    "--format",
+                    "{{.Name}}",
+                    "--filter",
+                    &format!("name=^{VOLUME_PREFIX}{}", toolchain),
+                ],
+                msg_info,
+            )?
+            .stdout()?;
+
+        if list.is_empty() {
+            Ok(vec![])
+        } else {
+            Ok(list.split('\n').map(ToOwned::to_owned).collect())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DockerContainer<'a, 'b> {
+    pub(crate) engine: &'a Engine,
+    pub(crate) name: &'b str,
+}
+
+impl<'a, 'b> DockerContainer<'a, 'b> {
+    pub const fn new(engine: &'a Engine, name: &'b str) -> Self {
+        Self { engine, name }
+    }
+
+    pub fn stop(&self, timeout: u32, msg_info: &mut MessageInfo) -> Result<ExitStatus> {
+        self.engine.run_and_get_status(
+            &["stop", self.name, "--time", &timeout.to_string()],
+            msg_info,
+        )
+    }
+
+    pub fn stop_default(&self, msg_info: &mut MessageInfo) -> Result<ExitStatus> {
+        // we want a faster timeout, since this might happen in signal
+        // handler. our containers normally clean up pretty fast, it's
+        // only without a pseudo-tty that they don't.
+        self.stop(DEFAULT_TIMEOUT, msg_info)
+    }
+
+    /// if stopping a container succeeds without a timeout, this command
+    /// can fail because the container no longer exists. however, if
+    /// the container was killed, we need to cleanup the exited container.
+    /// just silence any warnings.
+    pub fn remove(&self, msg_info: &mut MessageInfo) -> Result<ExitStatus> {
+        self.engine
+            .run_and_get_output(&["rm", self.name], msg_info)
+            .map(|output| output.status)
+    }
+
+    pub fn state(&self, msg_info: &mut MessageInfo) -> Result<ContainerState> {
+        let stdout = self
+            .engine
+            .command()
+            .args(["ps", "-a"])
+            .args(["--filter", &format!("name={}", self.name)])
+            .args(["--format", "{{.State}}"])
+            .run_and_get_stdout(msg_info)?;
+        ContainerState::new(stdout.trim())
+    }
+}
+
+pub(crate) fn time_to_millis(timestamp: &time::SystemTime) -> Result<u64> {
+    Ok(timestamp
+        .duration_since(time::SystemTime::UNIX_EPOCH)?
+        .as_millis() as u64)
+}
+
+pub(crate) fn time_from_millis(millis: u64) -> time::SystemTime {
+    time::SystemTime::UNIX_EPOCH + time::Duration::from_millis(millis)
+}
+
+pub(crate) fn now_as_millis() -> Result<u64> {
+    time_to_millis(&time::SystemTime::now())
+}
+
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55
 # This file is a cache directory tag created by cross.
 # For information about cache directory tags see https://bford.info/cachedir/";
@@ -401,65 +824,100 @@ fn create_target_dir(path: &Path) -> Result<()> {
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path.join("CACHEDIR.TAG"))?
+            .open(path.join("CACHEDIR.TAG"))?
             .write_all(CACHEDIR_TAG.as_bytes())?;
     }
     Ok(())
 }
 
-pub fn command(engine: &Engine) -> Command {
-    let mut command = Command::new(&engine.path);
-    if engine.needs_remote() {
-        // if we're using podman and not podman-remote, need `--remote`.
-        command.arg("--remote");
+impl Engine {
+    pub fn command(&self) -> Command {
+        let mut command = Command::new(&self.path);
+        if self.needs_remote() {
+            // if we're using podman and not podman-remote, need `--remote`.
+            command.arg("--remote");
+        }
+        command
     }
-    command
+
+    pub fn subcommand(&self, cmd: &str) -> Command {
+        let mut command = self.command();
+        command.arg(cmd);
+        command
+    }
+
+    #[track_caller]
+    pub(crate) fn run_and_get_status(
+        &self,
+        args: &[&str],
+        msg_info: &mut MessageInfo,
+    ) -> Result<ExitStatus> {
+        self.command().args(args).run_and_get_status(msg_info, true)
+    }
+
+    #[track_caller]
+    pub(crate) fn run_and_get_output(
+        &self,
+        args: &[&str],
+        msg_info: &mut MessageInfo,
+    ) -> Result<Output> {
+        self.command().args(args).run_and_get_output(msg_info)
+    }
+
+    pub fn parse_opts(value: &str) -> Result<Vec<String>> {
+        shell_words::split(value)
+            .wrap_err_with(|| format!("could not parse docker opts of {}", value))
+    }
+
+    /// Register binfmt interpreters
+    pub(crate) fn register_binfmt(
+        &self,
+        target: &Target,
+        msg_info: &mut MessageInfo,
+    ) -> Result<()> {
+        let cmd = if target.is_windows() {
+            // https://www.kernel.org/doc/html/latest/admin-guide/binfmt-misc.html
+            "mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc && \
+                echo ':wine:M::MZ::/usr/bin/run-detectors:' > /proc/sys/fs/binfmt_misc/register"
+        } else {
+            "apt-get update && apt-get install --no-install-recommends --assume-yes \
+                binfmt-support qemu-user-static"
+        };
+
+        let mut docker = self.subcommand("run");
+        docker.add_userns();
+        docker.arg("--privileged");
+        docker.arg("--rm");
+        docker.arg(UBUNTU_BASE);
+        docker.args(["sh", "-c", cmd]);
+
+        docker.run(msg_info, false).map_err(Into::into)
+    }
 }
 
-pub fn subcommand(engine: &Engine, cmd: &str) -> Command {
-    let mut command = command(engine);
-    command.arg(cmd);
-    command
-}
-
-pub fn get_package_info(
-    engine: &Engine,
-    toolchain: QualifiedToolchain,
+fn validate_env_var<'a>(
+    var: &'a str,
+    warned: &mut bool,
+    var_type: &'static str,
+    var_syntax: &'static str,
     msg_info: &mut MessageInfo,
-) -> Result<(Directories, CargoMetadata)> {
-    let metadata = cargo_metadata_with_args(None, None, msg_info)?
-        .ok_or(eyre::eyre!("unable to get project metadata"))?;
-    let mount_finder = MountFinder::create(engine)?;
-    let cwd = std::env::current_dir()?;
-    Directories::assemble(&mount_finder, metadata, &cwd, toolchain)
-}
-
-/// Register binfmt interpreters
-pub(crate) fn register(engine: &Engine, target: &Target, msg_info: &mut MessageInfo) -> Result<()> {
-    let cmd = if target.is_windows() {
-        // https://www.kernel.org/doc/html/latest/admin-guide/binfmt-misc.html
-        "mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc && \
-            echo ':wine:M::MZ::/usr/bin/run-detectors:' > /proc/sys/fs/binfmt_misc/register"
-    } else {
-        "apt-get update && apt-get install --no-install-recommends --assume-yes \
-            binfmt-support qemu-user-static"
-    };
-
-    let mut docker = subcommand(engine, "run");
-    docker_userns(&mut docker);
-    docker.arg("--privileged");
-    docker.arg("--rm");
-    docker.arg(UBUNTU_BASE);
-    docker.args(["sh", "-c", cmd]);
-
-    docker.run(msg_info, false).map_err(Into::into)
-}
-
-fn validate_env_var(var: &str) -> Result<(&str, Option<&str>)> {
+) -> Result<(&'a str, Option<&'a str>)> {
     let (key, value) = match var.split_once('=') {
         Some((key, value)) => (key, Some(value)),
         _ => (var, None),
     };
+
+    if value.is_none()
+        && !*warned
+        && !var
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | 'A'..='Z' | '_' ))
+    {
+        msg_info.warn(format_args!(
+            "got {var_type} of \"{var}\" which is not a valid environment variable name. the proper syntax is {var_syntax}"
+        ))?;
+        *warned = true;
+    }
 
     if key == "CROSS_RUNNER" {
         eyre::bail!(
@@ -470,171 +928,302 @@ fn validate_env_var(var: &str) -> Result<(&str, Option<&str>)> {
     Ok((key, value))
 }
 
-pub fn parse_docker_opts(value: &str) -> Result<Vec<String>> {
-    shell_words::split(value).wrap_err_with(|| format!("could not parse docker opts of {}", value))
-}
-
-pub(crate) fn cargo_safe_command(cargo_variant: CargoVariant) -> SafeCommand {
-    SafeCommand::new(cargo_variant.to_str())
-}
-
-fn add_cargo_configuration_envvars(docker: &mut Command) {
-    let non_cargo_prefix = &[
-        "http_proxy",
-        "TERM",
-        "RUSTDOCFLAGS",
-        "RUSTFLAGS",
-        "BROWSER",
-        "HTTPS_PROXY",
-        "HTTP_TIMEOUT",
-        "https_proxy",
-    ];
-    let cargo_prefix_skip = &[
-        "CARGO_HOME",
-        "CARGO_TARGET_DIR",
-        "CARGO_BUILD_TARGET_DIR",
-        "CARGO_BUILD_RUSTC",
-        "CARGO_BUILD_RUSTC_WRAPPER",
-        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-        "CARGO_BUILD_RUSTDOC",
-    ];
-    let is_cargo_passthrough = |key: &str| -> bool {
-        non_cargo_prefix.contains(&key)
-            || key.starts_with("CARGO_") && !cargo_prefix_skip.contains(&key)
-    };
-
-    // also need to accept any additional flags used to configure
-    // cargo, but only pass what's actually present.
-    for (key, _) in env::vars() {
-        if is_cargo_passthrough(&key) {
-            docker.args(["-e", &key]);
-        }
+impl CargoVariant {
+    pub(crate) fn safe_command(self) -> SafeCommand {
+        SafeCommand::new(self.to_str())
     }
 }
 
-pub(crate) fn docker_envvars(
-    docker: &mut Command,
-    config: &Config,
-    dirs: &Directories,
-    target: &Target,
-    cargo_variant: CargoVariant,
-    msg_info: &mut MessageInfo,
-) -> Result<()> {
-    for ref var in config.env_passthrough(target)?.unwrap_or_default() {
-        validate_env_var(var)?;
-
-        // Only specifying the environment variable name in the "-e"
-        // flag forwards the value from the parent shell
-        docker.args(["-e", var]);
-    }
-
-    let runner = config.runner(target)?;
-    let cross_runner = format!("CROSS_RUNNER={}", runner.unwrap_or_default());
-    docker
-        .args(["-e", "PKG_CONFIG_ALLOW_CROSS=1"])
-        .args(["-e", &format!("XARGO_HOME={}", dirs.xargo_mount_path())])
-        .args(["-e", &format!("CARGO_HOME={}", dirs.cargo_mount_path())])
-        .args(["-e", "CARGO_TARGET_DIR=/target"])
-        .args(["-e", &cross_runner]);
-    if cargo_variant.uses_zig() {
-        // otherwise, zig has a permission error trying to create the cache
-        docker.args(["-e", "XDG_CACHE_HOME=/target/.zig-cache"]);
-    }
-    add_cargo_configuration_envvars(docker);
-
-    if let Some(username) = id::username().wrap_err("could not get username")? {
-        docker.args(["-e", &format!("USER={username}")]);
-    }
-
-    if let Ok(value) = env::var("QEMU_STRACE") {
-        docker.args(["-e", &format!("QEMU_STRACE={value}")]);
-    }
-
-    if let Ok(value) = env::var("CROSS_DEBUG") {
-        docker.args(["-e", &format!("CROSS_DEBUG={value}")]);
-    }
-
-    if let Ok(value) = env::var("CROSS_CONTAINER_OPTS") {
-        if env::var("DOCKER_OPTS").is_ok() {
-            msg_info.warn("using both `CROSS_CONTAINER_OPTS` and `DOCKER_OPTS`.")?;
-        }
-        docker.args(&parse_docker_opts(&value)?);
-    } else if let Ok(value) = env::var("DOCKER_OPTS") {
-        // FIXME: remove this when we deprecate DOCKER_OPTS.
-        docker.args(&parse_docker_opts(&value)?);
-    };
-
-    Ok(())
+pub(crate) trait DockerCommandExt {
+    fn add_configuration_envvars(&mut self);
+    fn add_envvars(
+        &mut self,
+        options: &DockerOptions,
+        dirs: &ToolchainDirectories,
+        msg_info: &mut MessageInfo,
+    ) -> Result<()>;
+    fn add_cwd(&mut self, paths: &DockerPaths) -> Result<()>;
+    fn add_build_command(&mut self, dirs: &ToolchainDirectories, cmd: &SafeCommand) -> &mut Self;
+    fn add_user_id(&mut self, engine_type: EngineType);
+    fn add_userns(&mut self);
+    fn add_seccomp(
+        &mut self,
+        engine_type: EngineType,
+        target: &Target,
+        metadata: &CargoMetadata,
+    ) -> Result<()>;
+    fn add_mounts(
+        &mut self,
+        options: &DockerOptions,
+        paths: &DockerPaths,
+        mount_cb: impl Fn(&mut Command, &Path, &Path) -> Result<()>,
+        store_cb: impl FnMut((String, String)),
+        msg_info: &mut MessageInfo,
+    ) -> Result<()>;
 }
 
-pub(crate) fn build_command(dirs: &Directories, cmd: &SafeCommand) -> String {
-    format!(
-        "PATH=\"$PATH\":\"{}/bin\" {:?}",
-        dirs.sysroot_mount_path(),
-        cmd
-    )
-}
-
-pub(crate) fn docker_cwd(docker: &mut Command, paths: &DockerPaths) -> Result<()> {
-    docker.args(["-w", paths.mount_cwd()]);
-
-    Ok(())
-}
-
-pub(crate) fn docker_mount(
-    docker: &mut Command,
-    options: &DockerOptions,
-    paths: &DockerPaths,
-    mount_cb: impl Fn(&mut Command, &Path, &Path) -> Result<()>,
-    mut store_cb: impl FnMut((String, String)),
-) -> Result<()> {
-    for ref var in options
-        .config
-        .env_volumes(&options.target)?
-        .unwrap_or_default()
-    {
-        let (var, value) = validate_env_var(var)?;
-        let value = match value {
-            Some(v) => Ok(v.to_owned()),
-            None => env::var(var),
+impl DockerCommandExt for Command {
+    fn add_configuration_envvars(&mut self) {
+        let other = &[
+            "http_proxy",
+            "TERM",
+            "RUSTDOCFLAGS",
+            "RUSTFLAGS",
+            "BROWSER",
+            "HTTPS_PROXY",
+            "HTTP_TIMEOUT",
+            "https_proxy",
+            "QEMU_STRACE",
+        ];
+        let cargo_prefix_skip = &[
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_BUILD_RUSTC",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTDOC",
+        ];
+        let cross_prefix_skip = &[
+            "CROSS_RUNNER",
+            "CROSS_RUSTC_MAJOR_VERSION",
+            "CROSS_RUSTC_MINOR_VERSION",
+            "CROSS_RUSTC_PATCH_VERSION",
+        ];
+        let is_passthrough = |key: &str| -> bool {
+            other.contains(&key)
+                || key.starts_with("CARGO_") && !cargo_prefix_skip.contains(&key)
+                || key.starts_with("CROSS_") && !cross_prefix_skip.contains(&key)
         };
 
-        // NOTE: we use canonical paths on the host, since it's unambiguous.
-        // however, for the mounted paths, we use the same path as was
-        // provided. this avoids canonicalizing symlinks which then causes
-        // the mounted path to differ from the path expected on the host.
-        // for example, if `/tmp` is a symlink to `/private/tmp`, canonicalizing
-        // it would lead to us mounting `/tmp/process` to `/private/tmp/process`,
-        // which would cause any code relying on `/tmp/process` to break.
+        // also need to accept any additional flags used to configure
+        // cargo or cross, but only pass what's actually present.
+        for (key, _) in env::vars() {
+            if is_passthrough(&key) {
+                self.args(["-e", &key]);
+            }
+        }
+    }
 
-        if let Ok(val) = value {
-            let canonical_path = file::canonicalize(&val)?;
+    fn add_envvars(
+        &mut self,
+        options: &DockerOptions,
+        dirs: &ToolchainDirectories,
+        msg_info: &mut MessageInfo,
+    ) -> Result<()> {
+        let mut warned = false;
+        for ref var in options
+            .config
+            .env_passthrough(&options.target)?
+            .unwrap_or_default()
+        {
+            validate_env_var(
+                var,
+                &mut warned,
+                "environment variable",
+                "`passthrough = [\"ENVVAR=value\"]`",
+                msg_info,
+            )?;
+
+            // Only specifying the environment variable name in the "-e"
+            // flag forwards the value from the parent shell
+            self.args(["-e", var]);
+        }
+
+        let runner = options.config.runner(&options.target)?;
+        let cross_runner = format!("CROSS_RUNNER={}", runner.unwrap_or_default());
+        self.args(["-e", "PKG_CONFIG_ALLOW_CROSS=1"])
+            .args(["-e", &format!("XARGO_HOME={}", dirs.xargo_mount_path())])
+            .args(["-e", &format!("CARGO_HOME={}", dirs.cargo_mount_path())])
+            .args([
+                "-e",
+                &format!("CROSS_RUST_SYSROOT={}", dirs.sysroot_mount_path()),
+            ])
+            .args(["-e", "CARGO_TARGET_DIR=/target"])
+            .args(["-e", &cross_runner]);
+        if options.cargo_variant.uses_zig() {
+            // otherwise, zig has a permission error trying to create the cache
+            self.args(["-e", "XDG_CACHE_HOME=/target/.zig-cache"]);
+        }
+        self.add_configuration_envvars();
+
+        if let Some(username) = id::username().wrap_err("could not get username")? {
+            self.args(["-e", &format!("USER={username}")]);
+        }
+
+        if let Ok(value) = env::var("CROSS_CONTAINER_OPTS") {
+            if env::var("DOCKER_OPTS").is_ok() {
+                msg_info.warn("using both `CROSS_CONTAINER_OPTS` and `DOCKER_OPTS`.")?;
+            }
+            self.args(&Engine::parse_opts(&value)?);
+        } else if let Ok(value) = env::var("DOCKER_OPTS") {
+            // FIXME: remove this when we deprecate DOCKER_OPTS.
+            self.args(&Engine::parse_opts(&value)?);
+        };
+
+        let (major, minor, patch) = match options.rustc_version.as_ref() {
+            Some(version) => (version.major, version.minor, version.patch),
+            // no toolchain version available, always provide the oldest
+            // compiler available. this isn't a major issue because
+            // linking with libgcc will not include symbols found in
+            // the builtins.
+            None => (1, 0, 0),
+        };
+        self.args(["-e", &format!("CROSS_RUSTC_MAJOR_VERSION={}", major)]);
+        self.args(["-e", &format!("CROSS_RUSTC_MINOR_VERSION={}", minor)]);
+        self.args(["-e", &format!("CROSS_RUSTC_PATCH_VERSION={}", patch)]);
+
+        Ok(())
+    }
+
+    fn add_cwd(&mut self, paths: &DockerPaths) -> Result<()> {
+        self.args(["-w", paths.mount_cwd()]);
+
+        Ok(())
+    }
+
+    fn add_build_command(&mut self, dirs: &ToolchainDirectories, cmd: &SafeCommand) -> &mut Self {
+        let build_command = format!(
+            "PATH=\"$PATH\":\"{}/bin\" {:?}",
+            dirs.sysroot_mount_path(),
+            cmd
+        );
+        self.args(["sh", "-c", &build_command])
+    }
+
+    fn add_user_id(&mut self, engine_type: EngineType) {
+        // by default, docker runs as root so we need to specify the user
+        // so the resulting file permissions are for the current user.
+        // since we can have rootless docker, we provide an override.
+        let is_rootless = env::var("CROSS_ROOTLESS_CONTAINER_ENGINE")
+            .ok()
+            .and_then(|s| match s.as_ref() {
+                "auto" => None,
+                b => Some(bool_from_envvar(b)),
+            })
+            .unwrap_or_else(|| engine_type != EngineType::Docker);
+        if !is_rootless {
+            self.args(["--user", &format!("{}:{}", user_id(), group_id(),)]);
+        }
+    }
+
+    fn add_userns(&mut self) {
+        let userns = match env::var("CROSS_CONTAINER_USER_NAMESPACE").ok().as_deref() {
+            Some("none") => None,
+            None | Some("auto") => Some("host".to_owned()),
+            Some(ns) => Some(ns.to_owned()),
+        };
+        if let Some(ns) = userns {
+            self.args(["--userns", &ns]);
+        }
+    }
+
+    #[allow(unused_mut, clippy::let_and_return)]
+    fn add_seccomp(
+        &mut self,
+        engine_type: EngineType,
+        target: &Target,
+        metadata: &CargoMetadata,
+    ) -> Result<()> {
+        // secured profile based off the docker documentation for denied syscalls:
+        // https://docs.docker.com/engine/security/seccomp/#significant-syscalls-blocked-by-the-default-profile
+        // note that we've allow listed `clone` and `clone3`, which is necessary
+        // to fork the process, and which podman allows by default.
+        const SECCOMP: &str = include_str!("seccomp.json");
+
+        // docker uses seccomp now on all installations
+        if target.needs_docker_seccomp() {
+            let seccomp = if engine_type.is_docker() && cfg!(target_os = "windows") {
+                // docker on windows fails due to a bug in reading the profile
+                // https://github.com/docker/for-win/issues/12760
+                "unconfined".to_owned()
+            } else {
+                #[allow(unused_mut)] // target_os = "windows"
+                let mut path = metadata
+                    .target_directory
+                    .join(target.triple())
+                    .join("seccomp.json");
+                if !path.exists() {
+                    write_file(&path, false)?.write_all(SECCOMP.as_bytes())?;
+                }
+                let mut path_string = path.to_utf8()?.to_owned();
+                #[cfg(target_os = "windows")]
+                if matches!(engine_type, EngineType::Podman | EngineType::PodmanRemote) {
+                    // podman weirdly expects a WSL path here, and fails otherwise
+                    path_string = path.as_posix_absolute()?;
+                }
+                path_string
+            };
+
+            self.args(["--security-opt", &format!("seccomp={}", seccomp)]);
+        }
+
+        Ok(())
+    }
+
+    fn add_mounts(
+        &mut self,
+        options: &DockerOptions,
+        paths: &DockerPaths,
+        mount_cb: impl Fn(&mut Command, &Path, &Path) -> Result<()>,
+        mut store_cb: impl FnMut((String, String)),
+        msg_info: &mut MessageInfo,
+    ) -> Result<()> {
+        let mut warned = false;
+        for ref var in options
+            .config
+            .env_volumes(&options.target)?
+            .unwrap_or_default()
+        {
+            let (var, value) = validate_env_var(
+                var,
+                &mut warned,
+                "volume",
+                "`volumes = [\"ENVVAR=/path/to/directory\"]`",
+                msg_info,
+            )?;
+            let value = match value {
+                Some(v) => Ok(v.to_owned()),
+                None => env::var(var),
+            };
+
+            // NOTE: we use canonical paths on the host, since it's unambiguous.
+            // however, for the mounted paths, we use the same path as was
+            // provided. this avoids canonicalizing symlinks which then causes
+            // the mounted path to differ from the path expected on the host.
+            // for example, if `/tmp` is a symlink to `/private/tmp`, canonicalizing
+            // it would lead to us mounting `/tmp/process` to `/private/tmp/process`,
+            // which would cause any code relying on `/tmp/process` to break.
+
+            if let Ok(val) = value {
+                let canonical_path = file::canonicalize(&val)?;
+                let host_path = paths.mount_finder.find_path(&canonical_path, true)?;
+                let absolute_path = Path::new(&val).as_posix_absolute()?;
+                let mount_path = paths
+                    .mount_finder
+                    .find_path(Path::new(&absolute_path), true)?;
+                mount_cb(self, host_path.as_ref(), mount_path.as_ref())?;
+                self.args(["-e", &format!("{}={}", var, mount_path)]);
+                store_cb((val, mount_path));
+            }
+        }
+
+        for path in paths.workspace_dependencies() {
+            // NOTE: we use canonical paths here since cargo metadata
+            // always canonicalizes paths, so these should be relative
+            // to the mounted project directory.
+            let canonical_path = file::canonicalize(path)?;
             let host_path = paths.mount_finder.find_path(&canonical_path, true)?;
-            let absolute_path = Path::new(&val).as_posix_absolute()?;
+            let absolute_path = Path::new(path).as_posix_absolute()?;
             let mount_path = paths
                 .mount_finder
                 .find_path(Path::new(&absolute_path), true)?;
-            mount_cb(docker, host_path.as_ref(), mount_path.as_ref())?;
-            docker.args(["-e", &format!("{}={}", var, mount_path)]);
-            store_cb((val, mount_path));
+            mount_cb(self, host_path.as_ref(), mount_path.as_ref())?;
+            store_cb((path.to_utf8()?.to_owned(), mount_path));
         }
-    }
 
-    for path in paths.workspace_dependencies() {
-        // NOTE: we use canonical paths here since cargo metadata
-        // always canonicalizes paths, so these should be relative
-        // to the mounted project directory.
-        let canonical_path = file::canonicalize(path)?;
-        let host_path = paths.mount_finder.find_path(&canonical_path, true)?;
-        let absolute_path = Path::new(path).as_posix_absolute()?;
-        let mount_path = paths
-            .mount_finder
-            .find_path(Path::new(&absolute_path), true)?;
-        mount_cb(docker, host_path.as_ref(), mount_path.as_ref())?;
-        store_cb((path.to_utf8()?.to_owned(), mount_path));
+        Ok(())
     }
-
-    Ok(())
 }
 
 pub(crate) fn user_id() -> String {
@@ -643,70 +1232,6 @@ pub(crate) fn user_id() -> String {
 
 pub(crate) fn group_id() -> String {
     env::var("CROSS_CONTAINER_GID").unwrap_or_else(|_| id::group().to_string())
-}
-
-pub(crate) fn docker_user_id(docker: &mut Command, engine_type: EngineType) {
-    // by default, docker runs as root so we need to specify the user
-    // so the resulting file permissions are for the current user.
-    // since we can have rootless docker, we provide an override.
-    let is_rootless = env::var("CROSS_ROOTLESS_CONTAINER_ENGINE")
-        .ok()
-        .and_then(|s| match s.as_ref() {
-            "auto" => None,
-            b => Some(bool_from_envvar(b)),
-        })
-        .unwrap_or_else(|| engine_type != EngineType::Docker);
-    if !is_rootless {
-        docker.args(["--user", &format!("{}:{}", user_id(), group_id(),)]);
-    }
-}
-
-pub(crate) fn docker_userns(docker: &mut Command) {
-    let userns = match env::var("CROSS_CONTAINER_USER_NAMESPACE").ok().as_deref() {
-        Some("none") => None,
-        None | Some("auto") => Some("host".to_owned()),
-        Some(ns) => Some(ns.to_owned()),
-    };
-    if let Some(ns) = userns {
-        docker.args(["--userns", &ns]);
-    }
-}
-
-#[allow(unused_mut, clippy::let_and_return)]
-pub(crate) fn docker_seccomp(
-    docker: &mut Command,
-    engine_type: EngineType,
-    target: &Target,
-    metadata: &CargoMetadata,
-) -> Result<()> {
-    // docker uses seccomp now on all installations
-    if target.needs_docker_seccomp() {
-        let seccomp = if engine_type.is_docker() && cfg!(target_os = "windows") {
-            // docker on windows fails due to a bug in reading the profile
-            // https://github.com/docker/for-win/issues/12760
-            "unconfined".to_owned()
-        } else {
-            #[allow(unused_mut)] // target_os = "windows"
-            let mut path = metadata
-                .target_directory
-                .join(target.triple())
-                .join("seccomp.json");
-            if !path.exists() {
-                write_file(&path, false)?.write_all(SECCOMP.as_bytes())?;
-            }
-            let mut path_string = path.to_utf8()?.to_owned();
-            #[cfg(target_os = "windows")]
-            if matches!(engine_type, EngineType::Podman | EngineType::PodmanRemote) {
-                // podman weirdly expects a WSL path here, and fails otherwise
-                path_string = path.as_posix_absolute()?;
-            }
-            path_string
-        };
-
-        docker.args(["--security-opt", &format!("seccomp={}", seccomp)]);
-    }
-
-    Ok(())
 }
 
 /// Simpler version of [get_image]
@@ -819,16 +1344,19 @@ pub(crate) fn get_image(config: &Config, target: &Target, uses_zig: bool) -> Res
     Ok(image)
 }
 
-fn docker_read_mount_paths(engine: &Engine) -> Result<Vec<MountDetail>> {
+fn docker_read_mount_paths(
+    engine: &Engine,
+    msg_info: &mut MessageInfo,
+) -> Result<Vec<MountDetail>> {
     let hostname = env::var("HOSTNAME").wrap_err("HOSTNAME environment variable not found")?;
 
     let mut docker: Command = {
-        let mut command = subcommand(engine, "inspect");
+        let mut command = engine.subcommand("inspect");
         command.arg(hostname);
         command
     };
 
-    let output = docker.run_and_get_stdout(&mut Verbosity::Quiet.into())?;
+    let output = docker.run_and_get_stdout(msg_info)?;
     let info = serde_json::from_str(&output).wrap_err("failed to parse docker inspect output")?;
     dockerinfo_parse_mounts(&info)
 }
@@ -846,7 +1374,7 @@ fn dockerinfo_parse_root_mount_path(info: &serde_json::Value) -> Result<MountDet
         .and_then(|v| v.as_str())
         .ok_or_else(|| eyre::eyre!("no driver name found"))?;
 
-    if driver_name == "overlay2" {
+    if driver_name.to_lowercase().contains("overlay") {
         let path = info
             .pointer("/0/GraphDriver/Data/MergedDir")
             .and_then(|v| v.as_str())
@@ -904,9 +1432,9 @@ impl MountFinder {
         MountFinder { mounts }
     }
 
-    pub fn create(engine: &Engine) -> Result<MountFinder> {
+    pub fn create(engine: &Engine, msg_info: &mut MessageInfo) -> Result<MountFinder> {
         Ok(if engine.in_docker {
-            MountFinder::new(docker_read_mount_paths(engine)?)
+            MountFinder::new(docker_read_mount_paths(engine, msg_info)?)
         } else {
             MountFinder::default()
         })
@@ -937,16 +1465,23 @@ impl MountFinder {
     }
 }
 
+/// Short hash for identifiers with minimal risk of collision.
+pub const PATH_HASH_SHORT: usize = 5;
+
+/// Longer hash to minimize risk of random collisions
+/// Collision chance is ~10^-6
+pub const PATH_HASH_UNIQUE: usize = 10;
+
 fn path_digest(path: &Path) -> Result<const_sha1::Digest> {
     let buffer = const_sha1::ConstBuffer::from_slice(path.to_utf8()?.as_bytes());
     Ok(const_sha1::sha1(&buffer))
 }
 
-pub fn path_hash(path: &Path) -> Result<String> {
+pub fn path_hash(path: &Path, count: usize) -> Result<String> {
     Ok(path_digest(path)?
         .to_string()
-        .get(..5)
-        .expect("sha1 is expected to be at least 5 characters long")
+        .get(..count)
+        .unwrap_or_else(|| panic!("sha1 is expected to be at least {count} characters long"))
         .to_owned())
 }
 
@@ -969,7 +1504,7 @@ mod tests {
 
         let test = |engine, expected| {
             let mut cmd = Command::new("engine");
-            docker_user_id(&mut cmd, engine);
+            cmd.add_user_id(engine);
             assert_eq!(expected, &format!("{cmd:?}"));
         };
         test(EngineType::Docker, &rootful);
@@ -1013,7 +1548,7 @@ mod tests {
 
         let test = |expected| {
             let mut cmd = Command::new("engine");
-            docker_userns(&mut cmd);
+            cmd.add_userns();
             assert_eq!(expected, &format!("{cmd:?}"));
         };
         test(&host);
@@ -1112,6 +1647,7 @@ mod tests {
                 &None,
                 &image_platform,
                 &sysroot,
+                false,
             ))
         }
 
@@ -1137,14 +1673,16 @@ mod tests {
             let mount_finder = MountFinder::new(vec![]);
             let metadata = cargo_metadata(false, &mut MessageInfo::default())?;
             let (directories, metadata) = get_directories(metadata, &mount_finder)?;
-            paths_equal(&directories.cargo, &home()?.join(".cargo"))?;
-            paths_equal(&directories.xargo, &home()?.join(".xargo"))?;
-            paths_equal(&directories.host_root, &metadata.workspace_root)?;
+            let toolchain_dirs = directories.toolchain_directories();
+            let package_dirs = directories.package_directories();
+            paths_equal(toolchain_dirs.cargo(), &home()?.join(".cargo"))?;
+            paths_equal(toolchain_dirs.xargo(), &home()?.join(".xargo"))?;
+            paths_equal(package_dirs.host_root(), &metadata.workspace_root)?;
             assert_eq!(
-                &directories.mount_root,
+                package_dirs.mount_root(),
                 &metadata.workspace_root.as_posix_absolute()?
             );
-            assert_eq!(&directories.mount_cwd, &get_cwd()?.as_posix_absolute()?);
+            assert_eq!(package_dirs.mount_cwd(), &get_cwd()?.as_posix_absolute()?);
 
             reset_env(vars);
             Ok(())
@@ -1170,7 +1708,8 @@ mod tests {
                 return Ok(());
             }
             let hostname = hostname.unwrap();
-            let output = subcommand(&engine, "inspect")
+            let output = engine
+                .subcommand("inspect")
                 .arg(hostname)
                 .run_and_get_output(&mut msg_info)?;
             if !output.status.success() {
@@ -1179,21 +1718,23 @@ mod tests {
                 return Ok(());
             }
 
-            let mount_finder = MountFinder::create(&engine)?;
+            let mount_finder = MountFinder::create(&engine, &mut msg_info)?;
             let metadata = cargo_metadata(true, &mut msg_info)?;
             let (directories, _) = get_directories(metadata, &mount_finder)?;
-            let mount_finder = MountFinder::new(docker_read_mount_paths(&engine)?);
+            let toolchain_dirs = directories.toolchain_directories();
+            let package_dirs = directories.package_directories();
+            let mount_finder = MountFinder::new(docker_read_mount_paths(&engine, &mut msg_info)?);
             let mount_path = |p| mount_finder.find_mount_path(p);
 
-            paths_equal(&directories.cargo, &mount_path(home()?.join(".cargo")))?;
-            paths_equal(&directories.xargo, &mount_path(home()?.join(".xargo")))?;
-            paths_equal(&directories.host_root, &mount_path(get_cwd()?))?;
+            paths_equal(toolchain_dirs.cargo(), &mount_path(home()?.join(".cargo")))?;
+            paths_equal(toolchain_dirs.xargo(), &mount_path(home()?.join(".xargo")))?;
+            paths_equal(package_dirs.host_root(), &mount_path(get_cwd()?))?;
             assert_eq!(
-                &directories.mount_root,
+                package_dirs.mount_root(),
                 &mount_path(get_cwd()?).as_posix_absolute()?
             );
             assert_eq!(
-                &directories.mount_cwd,
+                package_dirs.mount_cwd(),
                 &mount_path(get_cwd()?).as_posix_absolute()?
             );
 

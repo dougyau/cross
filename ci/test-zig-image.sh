@@ -20,7 +20,7 @@ TARGETS=(
     "i586-unknown-linux-musl"
 )
 
-# on CI, it sets `CROSS_TARGET_ZIG_IMAGE` rather than `CROSS_TARGET_ZIG_IMAGE`
+# on CI, it sets `CROSS_TARGET_ZIG_IMAGE` rather than `CROSS_BUILD_ZIG_IMAGE`
 if [[ -n "${CROSS_TARGET_ZIG_IMAGE}" ]]; then
     export CROSS_BUILD_ZIG_IMAGE="${CROSS_TARGET_ZIG_IMAGE}"
     unset CROSS_TARGET_ZIG_IMAGE
@@ -34,7 +34,8 @@ main() {
 
     retry cargo fetch
     cargo build
-    export CROSS="${PROJECT_HOME}/target/debug/cross"
+    CROSS=$(binary_path cross "${PROJECT_HOME}" debug)
+    export CROSS
 
     td="$(mktemp -d)"
     git clone --depth 1 https://github.com/cross-rs/rust-cpp-hello-word "${td}"
